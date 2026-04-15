@@ -1,0 +1,88 @@
+/aruco_detector_node:
+  ros__parameters:
+    coord_object_0_marker_0:
+    - -6.0
+    - -1.0
+    - 0.0
+    - -1.0
+    - -1.0
+    - 0.0
+    - -1.0
+    - -6.0
+    - 0.0
+    - -6.0
+    - -6.0
+    - 0.0
+    coord_world_marker_0:
+    - 1.0
+    - 6.0
+    - 0.0
+    - 6.0
+    - 6.0
+    - 0.0
+    - 6.0
+    - 1.0
+    - 0.0
+    - 1.0
+    - 1.0
+    - 0.0
+    coord_world_marker_1:
+    - 1.0
+    - 83.5
+    - 0.0
+    - 6.0
+    - 83.5
+    - 0.0
+    - 6.0
+    - 78.5
+    - 0.0
+    - 1.0
+    - 78.5
+    - 0.0
+    coord_world_marker_2:
+    - 48.5
+    - 83.5
+    - 0.0
+    - 53.5
+    - 83.5
+    - 0.0
+    - 53.5
+    - 78.5
+    - 0.0
+    - 48.5
+    - 78.5
+    - 0.0
+    coord_world_marker_3:
+    - 48.5
+    - 6.0
+    - 0.0
+    - 53.5
+    - 6.0
+    - 0.0
+    - 53.5
+    - 1.0
+    - 0.0
+    - 48.5
+    - 1.0
+    - 0.0
+    count_object_marker: 1
+    count_world_marker: 4
+    id_object_0_marker_0: 23
+    id_world_marker_0: 24
+    id_world_marker_1: 25
+    id_world_marker_2: 26
+    id_world_marker_3: 27
+    input_topic: /image_with_undetect_markers
+    markers_topic: /detected_points
+    output_topic: /image_with_detect_markers
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    start_type_description_service: true
+    use_sim_time: false
+    world_name: world
+
