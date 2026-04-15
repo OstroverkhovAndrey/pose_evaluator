@@ -31,27 +31,27 @@ ament_export_dependencies(rosidl_default_runtime)
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} rosidl_typesupport_cpp)
 
-# add_executable(image_publisher src/image_publisher/image_publisher.cpp)
-# target_link_libraries(
-#   image_publisher PUBLIC 
-#   rclcpp::rclcpp 
-#   ${std_msgs_TARGETS} 
-#   ${sensor_msgs_TARGETS} 
-#   ${OpenCV_LIBS} 
-#   cv_bridge::cv_bridge 
-#   camera_info_manager::camera_info_manager 
-#   "${cpp_typesupport_target}")
+add_executable(image_publisher src/image_publisher/image_publisher.cpp)
+target_link_libraries(
+  image_publisher PUBLIC 
+  rclcpp::rclcpp 
+  ${std_msgs_TARGETS} 
+  ${sensor_msgs_TARGETS} 
+  ${OpenCV_LIBS} 
+  cv_bridge::cv_bridge 
+  camera_info_manager::camera_info_manager 
+  "${cpp_typesupport_target}")
 # 
-# add_executable(image_extractor src/image_extractor/image_extractor.cpp)
-# target_link_libraries(
-#   image_extractor PUBLIC 
-#   rclcpp::rclcpp 
-#   ${std_msgs_TARGETS} 
-#   ${sensor_msgs_TARGETS} 
-#   ${OpenCV_LIBS} 
-#   cv_bridge::cv_bridge 
-#   camera_info_manager::camera_info_manager 
-#   "${cpp_typesupport_target}")
+add_executable(image_extractor src/image_extractor/image_extractor.cpp)
+target_link_libraries(
+  image_extractor PUBLIC 
+  rclcpp::rclcpp 
+  ${std_msgs_TARGETS} 
+  ${sensor_msgs_TARGETS} 
+  ${OpenCV_LIBS} 
+  cv_bridge::cv_bridge 
+  camera_info_manager::camera_info_manager 
+  "${cpp_typesupport_target}")
 
 add_executable(aruco_detector_node src/aruco_detector/aruco_detector_node.cpp)
 target_link_libraries(aruco_detector_node PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS} ${sensor_msgs_TARGETS} ${OpenCV_LIBS} cv_bridge::cv_bridge "${cpp_typesupport_target}")
@@ -60,8 +60,8 @@ add_executable(pose_evaluator_node src/pose_evaluator/pose_evaluator_node.cpp)
 target_link_libraries(pose_evaluator_node PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS} ${sensor_msgs_TARGETS} ${OpenCV_LIBS} cv_bridge::cv_bridge "${cpp_typesupport_target}" ${tf2_TARGETS} ${tf2_ros_TARGETS} Eigen3::Eigen)
 
 install(TARGETS 
-#  image_publisher
-#  image_extractor
+  image_publisher
+  image_extractor
   aruco_detector_node
   pose_evaluator_node
   DESTINATION lib/${PROJECT_NAME})
