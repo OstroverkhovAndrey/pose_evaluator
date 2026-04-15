@@ -1,4 +1,3 @@
-
 #pragma once
 #include "pose_evaluator/filter.hpp"
 #include "pose_evaluator/process_model.hpp"
@@ -24,8 +23,7 @@ public:
   };
 
   explicit UnscentedKalmanFilter(std::shared_ptr<IProcessModel> process_model)
-  : UnscentedKalmanFilter(std::move(process_model), Params())
-  {}
+  : UnscentedKalmanFilter(std::move(process_model), Params()) {}
 
   UnscentedKalmanFilter(
     std::shared_ptr<IProcessModel> process_model,
@@ -62,8 +60,8 @@ public:
     const double lambda = params_.alpha * params_.alpha * (NA + params_.kappa) - NA;
 
     Eigen::Matrix<double, NA, NA> P_aug = Eigen::Matrix<double, NA, NA>::Zero();
-    P_aug.block<12, 12>(0, 0) = P_;
-    P_aug.block<6, 6>(12, 12) = process_model_->noiseCov(dt);
+    P_aug.block<12,12>(0,0) = P_;
+    P_aug.block<6,6>(12,12) = process_model_->noiseCov(dt);
     P_aug += params_.jitter * Eigen::Matrix<double, NA, NA>::Identity();
 
     Eigen::Matrix<double, NA, NA> L = ((NA + lambda) * P_aug).llt().matrixL();
@@ -73,18 +71,18 @@ public:
 
     std::vector<State> sigma_pred(2 * NA + 1);
 
-    auto propagate_sigma = [&](const Eigen::Matrix<double, NA, 1> & delta) {
+    auto propagateSigma = [&](const Eigen::Matrix<double, NA, 1> & delta) {
       ErrorVec dx = delta.template segment<12>(0);
       ProcessNoiseVec dw = delta.template segment<6>(12);
       State sigma_state = StateOps::boxPlus(x_, dx);
       return process_model_->propagate(sigma_state, dw, dt);
     };
 
-    sigma_pred[0] = propagate_sigma(Eigen::Matrix<double, NA, 1>::Zero());
+    sigma_pred[0] = propagateSigma(Eigen::Matrix<double, NA, 1>::Zero());
 
     for (int i = 0; i < NA; ++i) {
-      sigma_pred[i + 1] = propagate_sigma(L.col(i));
-      sigma_pred[i + 1 + NA] = propagate_sigma(-L.col(i));
+      sigma_pred[i + 1] = propagateSigma(L.col(i));
+      sigma_pred[i + 1 + NA] = propagateSigma(-L.col(i));
     }
 
     State x_mean = computeStateMean(sigma_pred, Wm);
@@ -120,6 +118,7 @@ public:
 
     std::vector<State> sigma_x(2 * NA + 1);
     sigma_x[0] = x_;
+
     for (int i = 0; i < NA; ++i) {
       sigma_x[i + 1] = StateOps::boxPlus(x_, L.col(i));
       sigma_x[i + 1 + NA] = StateOps::boxPlus(x_, -L.col(i));
@@ -159,16 +158,15 @@ public:
   const Cov12 & covariance() const override { return P_; }
 
 private:
-  static void computeWeights(
+  void computeWeights(
     int n,
     double lambda,
     std::vector<double> & Wm,
-    std::vector<double> & Wc,
-    double alpha = 1e-2,
-    double beta = 2.0)
+    std::vector<double> & Wc) const
   {
     Wm[0] = lambda / (n + lambda);
-    Wc[0] = Wm[0] + (1.0 - alpha * alpha + beta);
+    Wc[0] = Wm[0] + (1.0 - params_.alpha * params_.alpha + params_.beta);
+
     for (int i = 1; i < 2 * n + 1; ++i) {
       Wm[i] = 1.0 / (2.0 * (n + lambda));
       Wc[i] = Wm[i];
@@ -191,6 +189,7 @@ private:
         break;
       }
     }
+
     return mean;
   }
 

@@ -1,189 +1,339 @@
-
-
-#include <chrono>
-#include <functional>
-#include <string>
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 
 #include <unordered_map>
+#include <string>
 #include <vector>
-#include <opencv2/highgui.hpp>
-#include <opencv2/calib3d.hpp>
+#include <memory>
+#include <algorithm>
 
-#include "rclcpp/rclcpp.hpp"
-#include "pose_evaluator/msg/detected_point.hpp"
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+
 #include "pose_evaluator/msg/detected_points.hpp"
 #include "pose_evaluator/filter_factory.hpp"
 #include "pose_evaluator/white_noise_rigid_body_model.hpp"
-#include "pose_evaluator/pinhole_point_measurement_model.hpp"
-#include <sensor_msgs/msg/camera_info.hpp>
+#include "pose_evaluator/camera_pinhole_measurement_model.hpp"
+#include "pose_evaluator/object_pinhole_measurement_model.hpp"
+#include "pose_evaluator/so3_utils.hpp"
 
-#include "geometry_msgs/msg/transform_stamped.hpp"
-#include "tf2/LinearMath/Quaternion.h"
-#include "tf2_ros/transform_broadcaster.h"
-
-using std::placeholders::_1;
 using pose_evaluator::State;
 using pose_evaluator::Cov12;
 using pose_evaluator::IFilter;
-using pose_evaluator::makeFilter;
-using pose_evaluator::WhiteNoiseRigidBodyModel;
 using pose_evaluator::CameraIntrinsics;
-using pose_evaluator::PointObservation;
-using pose_evaluator::PinholePointMeasurementModel;
+using pose_evaluator::WorldPointObservation;
+using pose_evaluator::ObjectPointObservation;
+using pose_evaluator::CameraPinholeMeasurementModel;
+using pose_evaluator::ObjectPinholeMeasurementModel;
+using pose_evaluator::makeCameraFilter;
+using pose_evaluator::makeObjectFilter;
+using pose_evaluator::WhiteNoiseRigidBodyModel;
 
-class PoseEvaluatorNode : public rclcpp::Node {
+class PoseEvaluatorNode : public rclcpp::Node
+{
 public:
-    PoseEvaluatorNode() : Node("pose_evaluator_node") {
+  PoseEvaluatorNode()
+  : Node("pose_evaluator_node")
+  {
+    camera_filter_type_ = declare_parameter<std::string>("camera_filter_type", "ukf");
+    object_filter_type_ = declare_parameter<std::string>("object_filter_type", "ukf");
 
-        RCLCPP_INFO(this->get_logger(), "start cst");
-        declare_parameters();
-        get_parameters();
+    sigma_a_ = declare_parameter<double>("sigma_a", 0.5);
+    sigma_alpha_ = declare_parameter<double>("sigma_alpha", 0.5);
+    sigma_px_ = declare_parameter<double>("sigma_px", 1.5);
 
-        auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(0.0, 0.0);
-        world_filter_ = makeFilter("simple", process_model);
-        for (int i = 0; i < count_object_; ++i) {
-            object_name__filter_.insert({objects_name_[i], makeFilter("simple", process_model)});
-        }
+    detections_sub_ = create_subscription<pose_evaluator::msg::DetectedPoints>(
+      "detected_points", 10,
+      std::bind(&PoseEvaluatorNode::detectionsCallback, this, std::placeholders::_1));
 
-        // create subscription
-        subscription_ = this->create_subscription<pose_evaluator::msg::DetectedPoints>(
-                detected_points_topic_name_, 10, std::bind(&PoseEvaluatorNode::topic_callback, this, _1));
-
-        // tf_broadcaster_ =
-        //     std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-        // readCameraParameters("./src/aruco_localization/resources/cameraCalib.txt", camMatrix_, distCoeffs_);
-
-        RCLCPP_INFO(this->get_logger(), "end cst");
-    }
+    pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("estimated_pose", 10);
+    twist_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("estimated_twist", 10);
+  }
 
 private:
+  struct TrackedEntity
+  {
+    std::unique_ptr<IFilter> filter;
+    rclcpp::Time last_stamp{0, 0, RCL_ROS_TIME};
 
-    void declare_parameters() {
-        this->declare_parameter("world_name", "world");
-        this->declare_parameter("count_object", 1);
-        for (int i = 0; i < this->get_parameter("count_object").as_int(); ++i) {
-            this->declare_parameter("object_" + std::to_string(i) + "_name", "object" + std::to_string(i));
-        }
-        this->declare_parameter("detected_points_topic_name", "detected_points");
+    Eigen::Vector3d last_position = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond last_orientation{1.0, 0.0, 0.0, 0.0};
+    rclcpp::Time last_output_stamp{0, 0, RCL_ROS_TIME};
+    bool last_output_valid{false};
+  };
+
+  TrackedEntity & getOrCreateCameraEntity(const std::string & camera_id)
+  {
+    auto it = camera_entities_.find(camera_id);
+    if (it != camera_entities_.end()) {
+      return it->second;
     }
 
-    void get_parameters() {
-        world_name_ = this->get_parameter("world_name").as_string();
-        count_object_ = this->get_parameter("count_object").as_int();
-        for (int i = 0; i < count_object_; ++i) {
-            std::string object_i_name = this->get_parameter("object_" + std::to_string(i) + "_name").as_string();
-            objects_name_.push_back(object_i_name);
-        }
-        detected_points_topic_name_ = this->get_parameter("detected_points_topic_name").as_string();
+    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    TrackedEntity entity;
+    entity.filter = makeCameraFilter(camera_filter_type_, process_model);
+    auto [new_it, inserted] = camera_entities_.emplace(camera_id, std::move(entity));
+    (void)inserted;
+    return new_it->second;
+  }
+
+  TrackedEntity & getOrCreateObjectEntity(const std::string & object_id)
+  {
+    auto it = object_entities_.find(object_id);
+    if (it != object_entities_.end()) {
+      return it->second;
     }
 
-    void create_observations(const pose_evaluator::msg::DetectedPoints & msg,
-                             std::vector<PointObservation>& observations_w,
-                             std::unordered_map<std::string, std::vector<PointObservation>>& object_name__observations_o) {
+    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    TrackedEntity entity;
+    entity.filter = makeObjectFilter(object_filter_type_, process_model);
+    auto [new_it, inserted] = object_entities_.emplace(object_id, std::move(entity));
+    (void)inserted;
+    return new_it->second;
+  }
 
-    //     std::vector<int> ids;
-    //     std::vector<std::vector<cv::Point2f>> corners;
+  static CameraIntrinsics intrinsicsFromCameraInfo(const sensor_msgs::msg::CameraInfo & info)
+  {
+    CameraIntrinsics K;
+    K.fx = info.k[0];
+    K.fy = info.k[4];
+    K.cx = info.k[2];
+    K.cy = info.k[5];
+    return K;
+  }
 
-    //     for (int i = 0; i < (int)msg.markers.size(); ++i)
-    //     {
-    //         ids.push_back(msg.markers[i].marker_id);
-    //         corners.push_back(std::vector<cv::Point2f>(4));
-    //         corners[i][0].x = msg.markers[i].up_left.x;
-    //         corners[i][0].y = msg.markers[i].up_left.y;
-    //         corners[i][1].x = msg.markers[i].up_right.x;
-    //         corners[i][1].y = msg.markers[i].up_right.y;
-    //         corners[i][2].x = msg.markers[i].down_right.x;
-    //         corners[i][2].y = msg.markers[i].down_right.y;
-    //         corners[i][3].x = msg.markers[i].down_left.x;
-    //         corners[i][3].y = msg.markers[i].down_left.y;
-    //     }
-
-    //     for (int i = 0; i < (int)ids.size(); ++i) {
-    //       int id = ids[i];
-    //       RCLCPP_INFO(this->get_logger(), "id %i", id);
-    //       for (int j = 0; j < 4; ++j) {
-    //         if (ids_world_marker_.find(id) != ids_world_marker_.end()) {
-    //             PointObservation obs;
-    //             obs.point_body = Eigen::Vector3d(
-    //               coords_world_marker_[id][j].x,
-    //               coords_world_marker_[id][j].y,
-    //               coords_world_marker_[id][j].z
-    //             );
-    //             obs.pixel = Eigen::Vector2d(
-    //                 corners[i][j].x,
-    //                 corners[i][j].y
-    //             );
-    //             observations_w.push_back(obs);
-    //         }
-    //         if (ids_object_marker_.find(id) != ids_object_marker_.end()) {
-    //             PointObservation obs;
-    //             obs.point_body = Eigen::Vector3d(
-    //               coords_object_marker_[id][j].x,
-    //               coords_object_marker_[id][j].y,
-    //               coords_object_marker_[id][j].z
-    //             );
-    //             obs.pixel = Eigen::Vector2d(
-    //                 corners[i][j].x,
-    //                 corners[i][j].y
-    //             );
-    //             observations_o.push_back(obs);
-    //         }
-    //       }
-    //     }
+  bool initializeCameraFilterFromPnP(
+    TrackedEntity & entity,
+    const CameraIntrinsics & K,
+    const std::vector<WorldPointObservation> & observations)
+  {
+    if (observations.size() < 4) {
+      return false;
     }
 
-    void topic_callback(const pose_evaluator::msg::DetectedPoints & msg) {
+    CameraPinholeMeasurementModel model(K, observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
 
-        RCLCPP_INFO(this->get_logger(), "start callback");
+    Cov12 P0 = Cov12::Identity();
+    P0.block<3,3>(0,0) *= 1e-2;
+    P0.block<3,3>(3,3) *= 1.0;
+    P0.block<3,3>(6,6) *= 1e-2;
+    P0.block<3,3>(9,9) *= 1.0;
 
-        std::vector<PointObservation> observations_w;
-        std::unordered_map<std::string, std::vector<PointObservation>> object_name__observations_o;
-        create_observations(msg, observations_w, object_name__observations_o);
+    State x0;
+    entity.filter->initialize(x0, P0);
+    entity.filter->update(z, model);
+    return entity.filter->isInitialized();
+  }
 
-         
-        world_filter_->predict(0.0);
-        for (int i = 0; i < count_object_; ++i) {
-            object_name__filter_[objects_name_[i]]->predict(0.0);
-        }
-
-        PinholePointMeasurementModel meas_model_w(K_, observations_w, sigma_px_);
-        Eigen::VectorXd z_w = meas_model_w.measurementVector();
-        world_filter_->update(z_w, meas_model_w);
-
-        for (int i = 0; i < count_object_; ++i) {
-            PinholePointMeasurementModel meas_model_o(K_, object_name__observations_o[objects_name_[i]], sigma_px_);
-            Eigen::VectorXd z_o = meas_model_o.measurementVector();
-            object_name__filter_[objects_name_[i]]->update(z_o, meas_model_o);
-        }
+  bool initializeObjectFilterFromPnP(
+    TrackedEntity & entity,
+    const CameraIntrinsics & K,
+    const State & camera_state,
+    const std::vector<ObjectPointObservation> & observations)
+  {
+    if (observations.size() < 4) {
+      return false;
     }
 
-    std::string world_name_;
-    int count_object_;
-    std::vector<std::string> objects_name_;
-    std::string detected_points_topic_name_;
+    ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
 
-    std::unique_ptr<IFilter> world_filter_;
-    std::unordered_map<std::string, std::unique_ptr<IFilter>> object_name__filter_;
+    Cov12 P0 = Cov12::Identity();
+    P0.block<3,3>(0,0) *= 1e-2;
+    P0.block<3,3>(3,3) *= 1.0;
+    P0.block<3,3>(6,6) *= 1e-2;
+    P0.block<3,3>(9,9) *= 1.0;
 
+    State x0;
+    entity.filter->initialize(x0, P0);
+    entity.filter->update(z, model);
+    return entity.filter->isInitialized();
+  }
 
-    rclcpp::Subscription<pose_evaluator::msg::DetectedPoints>::SharedPtr subscription_;
-    int countMarkersWorldCoordinateSystem_;
-    int countMarkersRobotCoordinateSystem_;
-    std::unordered_map<int, std::vector<cv::Point3f>> markersWorldCoordinateSystem_;
-    std::unordered_map<int, std::vector<cv::Point3f>> markersRobotCoordinateSystem_;
-    cv::Mat camMatrix_, distCoeffs_;
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-    std::string robot_name_;
-    int i_ = 0;
+  void updateCameraEntity(
+    TrackedEntity & entity,
+    const CameraIntrinsics & K,
+    const std::vector<WorldPointObservation> & observations,
+    const rclcpp::Time & stamp)
+  {
+    if (observations.size() < 4) {
+      return;
+    }
 
-    CameraIntrinsics K_;
-    double sigma_px_;
+    if (!entity.filter->isInitialized()) {
+      initializeCameraFilterFromPnP(entity, K, observations);
+      entity.last_stamp = stamp;
+      return;
+    }
+
+    double dt = 0.0;
+    if (entity.last_stamp.nanoseconds() != 0) {
+      dt = (stamp - entity.last_stamp).seconds();
+      if (dt < 0.0) {
+        dt = 0.0;
+      }
+    }
+    entity.last_stamp = stamp;
+
+    entity.filter->predict(dt);
+
+    CameraPinholeMeasurementModel model(K, observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
+    entity.filter->update(z, model);
+  }
+
+  void updateObjectEntity(
+    TrackedEntity & entity,
+    const CameraIntrinsics & K,
+    const State & camera_state,
+    const std::vector<ObjectPointObservation> & observations,
+    const rclcpp::Time & stamp)
+  {
+    if (observations.size() < 4) {
+      return;
+    }
+
+    if (!entity.filter->isInitialized()) {
+      initializeObjectFilterFromPnP(entity, K, camera_state, observations);
+      entity.last_stamp = stamp;
+      return;
+    }
+
+    double dt = 0.0;
+    if (entity.last_stamp.nanoseconds() != 0) {
+      dt = (stamp - entity.last_stamp).seconds();
+      if (dt < 0.0) {
+        dt = 0.0;
+      }
+    }
+    entity.last_stamp = stamp;
+
+    entity.filter->predict(dt);
+
+    ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
+    entity.filter->update(z, model);
+  }
+
+  void publishObjectState(const std::string & object_id, TrackedEntity & entity, const rclcpp::Time & stamp)
+  {
+    if (!entity.filter->isInitialized()) {
+      return;
+    }
+
+    const auto & x = entity.filter->state();
+
+    geometry_msgs::msg::PoseStamped pose_msg;
+    pose_msg.header.stamp = stamp;
+    pose_msg.header.frame_id = "world";
+    pose_msg.header.stamp = stamp;
+    pose_msg.pose.position.x = x.p.x();
+    pose_msg.pose.position.y = x.p.y();
+    pose_msg.pose.position.z = x.p.z();
+    pose_msg.pose.orientation.x = x.q.x();
+    pose_msg.pose.orientation.y = x.q.y();
+    pose_msg.pose.orientation.z = x.q.z();
+    pose_msg.pose.orientation.w = x.q.w();
+    pose_pub_->publish(pose_msg);
+
+    geometry_msgs::msg::TwistStamped twist_msg;
+    twist_msg.header = pose_msg.header;
+
+    if (entity.last_output_valid) {
+      const double dt = (stamp - entity.last_output_stamp).seconds();
+      if (dt > 1e-6) {
+        const Eigen::Vector3d v = (x.p - entity.last_position) / dt;
+        twist_msg.twist.linear.x = v.x();
+        twist_msg.twist.linear.y = v.y();
+        twist_msg.twist.linear.z = v.z();
+
+        const Eigen::Quaterniond dq = entity.last_orientation.conjugate() * x.q;
+        const Eigen::Vector3d dtheta = pose_evaluator::quatLog(dq);
+        const Eigen::Vector3d w = dtheta / dt;
+
+        twist_msg.twist.angular.x = w.x();
+        twist_msg.twist.angular.y = w.y();
+        twist_msg.twist.angular.z = w.z();
+      }
+    }
+
+    twist_pub_->publish(twist_msg);
+
+    entity.last_position = x.p;
+    entity.last_orientation = x.q;
+    entity.last_output_stamp = stamp;
+    entity.last_output_valid = true;
+
+    (void)object_id; // при желании можно добавить object_id в отдельный топик/namespace
+  }
+
+  void detectionsCallback(const pose_evaluator::msg::DetectedPoints::SharedPtr msg)
+  {
+    const auto stamp = msg->header.stamp;
+    const auto camera_id = msg->camera_id;
+    const CameraIntrinsics K = intrinsicsFromCameraInfo(msg->camera_info);
+
+    std::vector<WorldPointObservation> world_obs;
+    std::unordered_map<std::string, std::vector<ObjectPointObservation>> object_obs_map;
+
+    for (const auto & p : msg->points) {
+      if (p.coordinate_frame == "world") {
+        WorldPointObservation obs;
+        obs.point_world = Eigen::Vector3d(p.x, p.y, p.z);
+        obs.pixel = Eigen::Vector2d(p.u, p.v);
+        world_obs.push_back(obs);
+      } else {
+        // считаем, что coordinate_frame задает object id, например "object_1"
+        ObjectPointObservation obs;
+        obs.point_object = Eigen::Vector3d(p.x, p.y, p.z);
+        obs.pixel = Eigen::Vector2d(p.u, p.v);
+        object_obs_map[p.coordinate_frame].push_back(obs);
+      }
+    }
+
+    // 1. update camera
+    auto & camera_entity = getOrCreateCameraEntity(camera_id);
+    updateCameraEntity(camera_entity, K, world_obs, stamp);
+
+    if (!camera_entity.filter->isInitialized()) {
+      return;
+    }
+
+    const State camera_state = camera_entity.filter->state();
+
+    // 2. update all objects seen by this camera
+    for (auto & kv : object_obs_map) {
+      const std::string & object_id = kv.first;
+      auto & observations = kv.second;
+
+      auto & object_entity = getOrCreateObjectEntity(object_id);
+      updateObjectEntity(object_entity, K, camera_state, observations, stamp);
+      publishObjectState(object_id, object_entity, stamp);
+    }
+  }
+
+private:
+  std::string camera_filter_type_;
+  std::string object_filter_type_;
+
+  double sigma_a_{0.5};
+  double sigma_alpha_{0.5};
+  double sigma_px_{1.5};
+
+  std::unordered_map<std::string, TrackedEntity> camera_entities_;
+  std::unordered_map<std::string, TrackedEntity> object_entities_;
+
+  rclcpp::Subscription<pose_evaluator::msg::DetectedPoints>::SharedPtr detections_sub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
 };
 
-int main(int argc, char * argv[]) {
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PoseEvaluatorNode>());
-    rclcpp::shutdown();
-    return 0;
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<PoseEvaluatorNode>());
+  rclcpp::shutdown();
+  return 0;
 }

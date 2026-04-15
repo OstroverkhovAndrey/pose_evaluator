@@ -1,0 +1,20 @@
+/image_publisher:
+  ros__parameters:
+    camera_height: 480
+    camera_id: 0
+    camera_info_path: file:///home/andrei2605/src/mag/src/pose_evaluator/resources/camera.yaml
+    camera_width: 640
+    debug_image_path: /home/andrei2605/src/mag/src/pose_evaluator/resources/img_00.png
+    mode: file
+    output_topic: /image_with_undetect_markers
+    publish_frequency: 1
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    start_type_description_service: true
+    use_sim_time: false
+

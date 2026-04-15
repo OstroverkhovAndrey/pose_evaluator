@@ -1,4 +1,3 @@
-
 #pragma once
 #include "pose_evaluator/process_model.hpp"
 #include "pose_evaluator/so3_utils.hpp"
@@ -24,7 +23,7 @@ public:
     out.p = x.p + x.v * dt + 0.5 * a * dt * dt;
     out.v = x.v + a * dt;
 
-    Eigen::Vector3d dtheta = x.w * dt + 0.5 * alpha * dt * dt;
+    const Eigen::Vector3d dtheta = x.w * dt + 0.5 * alpha * dt * dt;
     out.q = (x.q * quatExp(dtheta)).normalized();
 
     out.w = x.w + alpha * dt;

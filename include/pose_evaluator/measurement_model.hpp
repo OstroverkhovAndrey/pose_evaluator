@@ -1,4 +1,3 @@
-
 #pragma once
 #include "pose_evaluator/state.hpp"
 #include <Eigen/Dense>

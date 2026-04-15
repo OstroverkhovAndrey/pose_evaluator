@@ -1,4 +1,3 @@
-
 #pragma once
 #include "pose_evaluator/measurement_model.hpp"
 #include <vector>
@@ -14,18 +13,18 @@ struct CameraIntrinsics
   double cy{0.0};
 };
 
-struct PointObservation
+struct WorldPointObservation
 {
-  Eigen::Vector3d point_body;   // point in local body frame (world or object)
-  Eigen::Vector2d pixel;        // detected pixel
+  Eigen::Vector3d point_world;
+  Eigen::Vector2d pixel;
 };
 
-class PinholePointMeasurementModel : public IMeasurementModel
+class CameraPinholeMeasurementModel : public IMeasurementModel
 {
 public:
-  PinholePointMeasurementModel(
+  CameraPinholeMeasurementModel(
     const CameraIntrinsics & K,
-    const std::vector<PointObservation> & observations,
+    const std::vector<WorldPointObservation> & observations,
     double sigma_px)
   : K_(K), observations_(observations), sigma_px_(sigma_px) {}
 
@@ -34,16 +33,20 @@ public:
     return static_cast<int>(2 * observations_.size());
   }
 
-  Eigen::VectorXd predictMeasurement(const State & x) const override
+  Eigen::VectorXd predictMeasurement(const State & camera_state) const override
   {
     Eigen::VectorXd zhat(measurementDim());
-    Eigen::Matrix3d R_cb = x.q.toRotationMatrix();  // body -> camera
+
+    const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
+    const Eigen::Matrix3d R_cw = R_wc.transpose();
+    const Eigen::Vector3d p_wc = camera_state.p;
 
     for (size_t i = 0; i < observations_.size(); ++i) {
-      Eigen::Vector3d Xc = R_cb * observations_[i].point_body + x.p;
+      const Eigen::Vector3d Xw = observations_[i].point_world;
+      const Eigen::Vector3d Xc = R_cw * (Xw - p_wc);
 
-      double u = K_.fx * (Xc.x() / Xc.z()) + K_.cx;
-      double v = K_.fy * (Xc.y() / Xc.z()) + K_.cy;
+      const double u = K_.fx * (Xc.x() / Xc.z()) + K_.cx;
+      const double v = K_.fy * (Xc.y() / Xc.z()) + K_.cy;
 
       zhat(2 * i + 0) = u;
       zhat(2 * i + 1) = v;
@@ -71,12 +74,12 @@ public:
     return z;
   }
 
-  const std::vector<PointObservation> & getObservations() const { return observations_; }
+  const std::vector<WorldPointObservation> & getObservations() const { return observations_; }
   const CameraIntrinsics & getIntrinsics() const { return K_; }
 
 private:
   CameraIntrinsics K_;
-  std::vector<PointObservation> observations_;
+  std::vector<WorldPointObservation> observations_;
   double sigma_px_;
 };
 

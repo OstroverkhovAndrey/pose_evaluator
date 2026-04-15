@@ -1,0 +1,17 @@
+/pose_evaluator_node:
+  ros__parameters:
+    camera_filter_type: ukf
+    object_filter_type: ukf
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    sigma_a: 0.5
+    sigma_alpha: 0.5
+    sigma_px: 1.5
+    start_type_description_service: true
+    use_sim_time: false
+

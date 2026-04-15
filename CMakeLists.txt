@@ -41,7 +41,7 @@ target_link_libraries(
   cv_bridge::cv_bridge 
   camera_info_manager::camera_info_manager 
   "${cpp_typesupport_target}")
-# 
+ 
 add_executable(image_extractor src/image_extractor/image_extractor.cpp)
 target_link_libraries(
   image_extractor PUBLIC 

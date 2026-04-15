@@ -1,4 +1,3 @@
-
 #pragma once
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -10,7 +9,6 @@ namespace pose_evaluator
 inline Eigen::Quaterniond quatExp(const Eigen::Vector3d & dtheta)
 {
   double angle = dtheta.norm();
-
   if (angle < 1e-12) {
     return Eigen::Quaterniond(
       1.0,
@@ -21,7 +19,6 @@ inline Eigen::Quaterniond quatExp(const Eigen::Vector3d & dtheta)
 
   Eigen::Vector3d axis = dtheta / angle;
   double half = 0.5 * angle;
-
   return Eigen::Quaterniond(
     std::cos(half),
     axis.x() * std::sin(half),
