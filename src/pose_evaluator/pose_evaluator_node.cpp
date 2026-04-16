@@ -103,119 +103,221 @@ private:
     return K;
   }
 
+
   bool initializeCameraFilterFromPnP(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const std::vector<WorldPointObservation> & observations)
-  {
-    if (observations.size() < 4) {
-      return false;
-    }
-
-    CameraPinholeMeasurementModel model(K, observations, sigma_px_);
-    Eigen::VectorXd z = model.measurementVector();
-
-    Cov12 P0 = Cov12::Identity();
-    P0.block<3,3>(0,0) *= 1e-2;
-    P0.block<3,3>(3,3) *= 1.0;
-    P0.block<3,3>(6,6) *= 1e-2;
-    P0.block<3,3>(9,9) *= 1.0;
-
-    State x0;
-    entity.filter->initialize(x0, P0);
-    entity.filter->update(z, model);
-    return entity.filter->isInitialized();
+  TrackedEntity & entity,
+  const CameraIntrinsics & K,
+  const std::vector<WorldPointObservation> & observations)
+{
+  if (observations.size() < 4) {
+    return false;
   }
 
-  bool initializeObjectFilterFromPnP(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const State & camera_state,
-    const std::vector<ObjectPointObservation> & observations)
-  {
-    if (observations.size() < 4) {
-      return false;
-    }
+  std::vector<cv::Point3f> world_points;
+  std::vector<cv::Point2f> image_points;
+  world_points.reserve(observations.size());
+  image_points.reserve(observations.size());
 
-    ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
-    Eigen::VectorXd z = model.measurementVector();
-
-    Cov12 P0 = Cov12::Identity();
-    P0.block<3,3>(0,0) *= 1e-2;
-    P0.block<3,3>(3,3) *= 1.0;
-    P0.block<3,3>(6,6) *= 1e-2;
-    P0.block<3,3>(9,9) *= 1.0;
-
-    State x0;
-    entity.filter->initialize(x0, P0);
-    entity.filter->update(z, model);
-    return entity.filter->isInitialized();
+  for (const auto & obs : observations) {
+    world_points.emplace_back(
+      static_cast<float>(obs.point_world.x()),
+      static_cast<float>(obs.point_world.y()),
+      static_cast<float>(obs.point_world.z()));
+    image_points.emplace_back(
+      static_cast<float>(obs.pixel.x()),
+      static_cast<float>(obs.pixel.y()));
   }
 
-  void updateCameraEntity(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const std::vector<WorldPointObservation> & observations,
-    const rclcpp::Time & stamp)
-  {
-    if (observations.size() < 4) {
-      return;
-    }
+  cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
+    K.fx, 0.0, K.cx,
+    0.0, K.fy, K.cy,
+    0.0, 0.0, 1.0);
 
-    if (!entity.filter->isInitialized()) {
-      initializeCameraFilterFromPnP(entity, K, observations);
+  cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
+  cv::Mat rvec, tvec;
+
+  const bool ok = cv::solvePnP(world_points, image_points, camera_matrix, dist, rvec, tvec);
+  if (!ok) {
+    return false;
+  }
+
+  cv::Mat Rcw_cv;
+  cv::Rodrigues(rvec, Rcw_cv);
+
+  Eigen::Matrix3d R_cw;
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      R_cw(r, c) = Rcw_cv.at<double>(r, c);
+    }
+  }
+
+  Eigen::Vector3d t_cw(
+    tvec.at<double>(0, 0),
+    tvec.at<double>(1, 0),
+    tvec.at<double>(2, 0));
+
+  const Eigen::Matrix3d R_wc = R_cw.transpose();
+  const Eigen::Vector3d p_wc = -R_wc * t_cw;
+
+  State x0;
+  x0.p = p_wc;
+  x0.q = Eigen::Quaterniond(R_wc).normalized();
+  x0.v.setZero();
+  x0.w.setZero();
+
+  Cov12 P0 = Cov12::Identity();
+  P0.block<3,3>(0,0) *= 1e-2;
+  P0.block<3,3>(3,3) *= 1.0;
+  P0.block<3,3>(6,6) *= 1e-2;
+  P0.block<3,3>(9,9) *= 1.0;
+
+  entity.filter->initialize(x0, P0);
+  return true;
+}
+
+  
+bool initializeObjectFilterFromPnP(
+  TrackedEntity & entity,
+  const CameraIntrinsics & K,
+  const State & camera_state,
+  const std::vector<ObjectPointObservation> & observations)
+{
+  if (observations.size() < 4) {
+    return false;
+  }
+
+  std::vector<cv::Point3f> object_points;
+  std::vector<cv::Point2f> image_points;
+  object_points.reserve(observations.size());
+  image_points.reserve(observations.size());
+
+  for (const auto & obs : observations) {
+    object_points.emplace_back(
+      static_cast<float>(obs.point_object.x()),
+      static_cast<float>(obs.point_object.y()),
+      static_cast<float>(obs.point_object.z()));
+    image_points.emplace_back(
+      static_cast<float>(obs.pixel.x()),
+      static_cast<float>(obs.pixel.y()));
+  }
+
+  cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
+    K.fx, 0.0, K.cx,
+    0.0, K.fy, K.cy,
+    0.0, 0.0, 1.0);
+
+  cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
+  cv::Mat rvec, tvec;
+
+  const bool ok = cv::solvePnP(object_points, image_points, camera_matrix, dist, rvec, tvec);
+  if (!ok) {
+    return false;
+  }
+
+  cv::Mat Rco_cv;
+  cv::Rodrigues(rvec, Rco_cv);
+
+  Eigen::Matrix3d R_co;
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      R_co(r, c) = Rco_cv.at<double>(r, c);
+    }
+  }
+
+  Eigen::Vector3d t_co(
+    tvec.at<double>(0, 0),
+    tvec.at<double>(1, 0),
+    tvec.at<double>(2, 0));
+
+  const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
+  const Eigen::Matrix3d R_wo = R_wc * R_co;
+  const Eigen::Vector3d p_wo = camera_state.p + R_wc * t_co;
+
+  State x0;
+  x0.p = p_wo;
+  x0.q = Eigen::Quaterniond(R_wo).normalized();
+  x0.v.setZero();
+  x0.w.setZero();
+
+  Cov12 P0 = Cov12::Identity();
+  P0.block<3,3>(0,0) *= 1e-2;
+  P0.block<3,3>(3,3) *= 1.0;
+  P0.block<3,3>(6,6) *= 1e-2;
+  P0.block<3,3>(9,9) *= 1.0;
+
+  entity.filter->initialize(x0, P0);
+  return true;
+}
+  
+
+void updateCameraEntity(
+  TrackedEntity & entity,
+  const CameraIntrinsics & K,
+  const std::vector<WorldPointObservation> & observations,
+  const rclcpp::Time & stamp)
+{
+  if (observations.size() < 4) {
+    return;
+  }
+
+  if (!entity.filter->isInitialized()) {
+    if (initializeCameraFilterFromPnP(entity, K, observations)) {
       entity.last_stamp = stamp;
-      return;
     }
-
-    double dt = 0.0;
-    if (entity.last_stamp.nanoseconds() != 0) {
-      dt = (stamp - entity.last_stamp).seconds();
-      if (dt < 0.0) {
-        dt = 0.0;
-      }
-    }
-    entity.last_stamp = stamp;
-
-    entity.filter->predict(dt);
-
-    CameraPinholeMeasurementModel model(K, observations, sigma_px_);
-    Eigen::VectorXd z = model.measurementVector();
-    entity.filter->update(z, model);
+    return;
   }
 
-  void updateObjectEntity(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const State & camera_state,
-    const std::vector<ObjectPointObservation> & observations,
-    const rclcpp::Time & stamp)
-  {
-    if (observations.size() < 4) {
-      return;
+  double dt = 0.0;
+  if (entity.last_stamp.nanoseconds() != 0) {
+    dt = (stamp - entity.last_stamp).seconds();
+    if (dt < 0.0) {
+      dt = 0.0;
     }
+  }
+  entity.last_stamp = stamp;
 
-    if (!entity.filter->isInitialized()) {
-      initializeObjectFilterFromPnP(entity, K, camera_state, observations);
+  entity.filter->predict(dt);
+
+  CameraPinholeMeasurementModel model(K, observations, sigma_px_);
+  const Eigen::VectorXd z = model.measurementVector();
+  entity.filter->update(z, model);
+}
+
+
+void updateObjectEntity(
+  TrackedEntity & entity,
+  const CameraIntrinsics & K,
+  const State & camera_state,
+  const std::vector<ObjectPointObservation> & observations,
+  const rclcpp::Time & stamp)
+{
+  if (observations.size() < 4) {
+    return;
+  }
+
+  if (!entity.filter->isInitialized()) {
+    if (initializeObjectFilterFromPnP(entity, K, camera_state, observations)) {
       entity.last_stamp = stamp;
-      return;
     }
-
-    double dt = 0.0;
-    if (entity.last_stamp.nanoseconds() != 0) {
-      dt = (stamp - entity.last_stamp).seconds();
-      if (dt < 0.0) {
-        dt = 0.0;
-      }
-    }
-    entity.last_stamp = stamp;
-
-    entity.filter->predict(dt);
-
-    ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
-    Eigen::VectorXd z = model.measurementVector();
-    entity.filter->update(z, model);
+    return;
   }
+
+  double dt = 0.0;
+  if (entity.last_stamp.nanoseconds() != 0) {
+    dt = (stamp - entity.last_stamp).seconds();
+    if (dt < 0.0) {
+      dt = 0.0;
+    }
+  }
+  entity.last_stamp = stamp;
+
+  entity.filter->predict(dt);
+
+  ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
+  const Eigen::VectorXd z = model.measurementVector();
+  entity.filter->update(z, model);
+}
+
 
   void publishObjectState(const std::string & object_id, TrackedEntity & entity, const rclcpp::Time & stamp)
   {
