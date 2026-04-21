@@ -115,59 +115,72 @@ public:
     if (!initialized_) {
       return;
     }
-
+  
     constexpr int NX = 12;
     const int nz = model.measurementDim();
-
+  
     const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
-
+  
+    // 1. Построение сигма-точек вокруг текущего состояния
     Eigen::Matrix<double, NX, NX> Pj = P_;
     Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
+  
     Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
-
+  
     std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
     computeWeights(NX, lambda, Wm, Wc);
-
-    // 1) sigma points in state space
+  
     std::vector<State> sigma_x(2 * NX + 1);
     sigma_x[0] = x_;
+  
     for (int i = 0; i < NX; ++i) {
-      sigma_x[i + 1] = StateOps::boxPlus(x_, L.col(i));
+      sigma_x[i + 1]      = StateOps::boxPlus(x_,  L.col(i));
       sigma_x[i + 1 + NX] = StateOps::boxPlus(x_, -L.col(i));
     }
-
-    // 2) propagate through measurement model
+  
+    // 2. Среднее состояние по сигма-точкам
+    State x_mean = computeStateMean(sigma_x, Wm);
+  
+    // 3. Прогон сигма-точек через модель измерения
     std::vector<Eigen::VectorXd> sigma_z(2 * NX + 1, Eigen::VectorXd(nz));
     for (int i = 0; i < 2 * NX + 1; ++i) {
       sigma_z[i] = model.predictMeasurement(sigma_x[i]);
     }
-
-    // 3) mean of predicted measurements
+  
+    // 4. Среднее предсказанное измерение
     Eigen::VectorXd z_mean = Eigen::VectorXd::Zero(nz);
     for (int i = 0; i < 2 * NX + 1; ++i) {
       z_mean += Wm[i] * sigma_z[i];
     }
-
-    // 4) innovation covariance and cross-covariance
-    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(nz, nz);
+  
+    // 5. Ковариация измерения и кросс-ковариация
+    Eigen::MatrixXd S   = Eigen::MatrixXd::Zero(nz, nz);
     Eigen::MatrixXd Pxz = Eigen::MatrixXd::Zero(NX, nz);
-
+  
     for (int i = 0; i < 2 * NX + 1; ++i) {
-      ErrorVec dx = StateOps::boxMinus(sigma_x[i], x_);
+      ErrorVec dx = StateOps::boxMinus(sigma_x[i], x_mean);
       Eigen::VectorXd dz = sigma_z[i] - z_mean;
-
-      S += Wc[i] * dz * dz.transpose();
+    
+      S   += Wc[i] * dz * dz.transpose();
       Pxz += Wc[i] * dx * dz.transpose();
     }
-
+  
+    // 6. Добавляем шум измерения
     S += model.measurementCov();
-
-    // 5) Kalman gain
+  
+    // 7. Коэффициент Калмана
     Eigen::MatrixXd K = Pxz * S.ldlt().solve(Eigen::MatrixXd::Identity(nz, nz));
-    ErrorVec dx = K * (z - z_mean);
-
-    // 6) update state and covariance
-    x_ = StateOps::boxPlus(x_, dx);
+  
+    // 8. Инновация
+    Eigen::VectorXd innovation = z - z_mean;
+  
+    // 9. Поправка в пространстве ошибок
+    ErrorVec dx_corr = K * innovation;
+  
+    // 10. Обновление состояния
+    x_ = StateOps::boxPlus(x_mean, dx_corr);
+  
+    // 11. Обновление ковариации
     P_ = P_ - K * S * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());
   }
