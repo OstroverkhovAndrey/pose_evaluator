@@ -41,7 +41,7 @@ public:
     for (size_t i = 0; i < observations_.size(); ++i) {
       const Eigen::Vector3d Xo = observations_[i].point_object;
       const Eigen::Vector3d Xw = R_wo * Xo + p_wo;
-      const Eigen::Vector3d Xc = R_cw * (Xw - p_wc);
+      const Eigen::Vector3d Xc = R_cw * (Xw + p_wc);
 
         if (!std::isfinite(Xc.z()) || std::abs(Xc.z()) < 1e-9) {
           std::cout << "Bad depth Xc.z = " << Xc.z() << std::endl;

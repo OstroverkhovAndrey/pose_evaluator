@@ -43,7 +43,7 @@ public:
 
     for (size_t i = 0; i < observations_.size(); ++i) {
       const Eigen::Vector3d Xw = observations_[i].point_world;
-      const Eigen::Vector3d Xc = R_cw * (Xw - p_wc);
+      const Eigen::Vector3d Xc = R_cw * (Xw + p_wc);
 
       const double u = K_.fx * (Xc.x() / Xc.z()) + K_.cx;
       const double v = K_.fy * (Xc.y() / Xc.z()) + K_.cy;
