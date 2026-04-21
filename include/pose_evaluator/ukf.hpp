@@ -21,6 +21,8 @@ public:
     double kappa{0.0};
     int mean_iterations{6};
     double jitter{1e-9};
+
+    // stddev of sampled linear/angular accelerations at each predict step
     double sigma_a{1e-5};
     double sigma_alpha{1e-5};
   };
@@ -52,40 +54,52 @@ public:
 
   void predict(double dt) override
   {
+    return;
+
     if (!initialized_) {
       return;
     }
 
+    // 1) Sample one process noise vector for this whole predict step
     static thread_local std::mt19937 gen(std::random_device{}());
     std::normal_distribution<double> ga(0.0, params_.sigma_a);
     std::normal_distribution<double> galpha(0.0, params_.sigma_alpha);
 
     Eigen::Vector3d a(ga(gen), ga(gen), ga(gen));
     Eigen::Vector3d alpha(galpha(gen), galpha(gen), galpha(gen));
-    ProcessNoiseVec a_alpha;
-    a_alpha << a, alpha;
 
+    ProcessNoiseVec sampled_noise;
+    sampled_noise << a, alpha;
+
+    // 2) Sigma points only over the state error
     constexpr int NX = 12;
     const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
 
     Eigen::Matrix<double, NX, NX> Pj = P_;
     Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
+
     Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
 
     std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
     computeWeights(NX, lambda, Wm, Wc);
 
+    // 3) Propagate all sigma points with the same sampled process noise
     std::vector<State> sigma_pred(2 * NX + 1);
-    sigma_pred[0] = process_model_->propagate(x_, a_alpha, dt); // центральная
+
+    sigma_pred[0] = process_model_->propagate(x_, sampled_noise, dt);
 
     for (int i = 0; i < NX; ++i) {
       ErrorVec dxi = L.col(i);
-      sigma_pred[i + 1]      = process_model_->propagate(StateOps::boxPlus(x_, dxi), a_alpha, dt);
-      sigma_pred[i + 1 + NX] = process_model_->propagate(StateOps::boxPlus(x_, -dxi), a_alpha, dt);
+      sigma_pred[i + 1] =
+        process_model_->propagate(StateOps::boxPlus(x_, dxi), sampled_noise, dt);
+      sigma_pred[i + 1 + NX] =
+        process_model_->propagate(StateOps::boxPlus(x_, -dxi), sampled_noise, dt);
     }
 
+    // 4) Mean of propagated sigma points
     State x_mean = computeStateMean(sigma_pred, Wm);
 
+    // 5) Covariance from propagated sigma points
     Cov12 P = Cov12::Zero();
     for (int i = 0; i < 2 * NX + 1; ++i) {
       ErrorVec dx = StateOps::boxMinus(sigma_pred[i], x_mean);
@@ -93,7 +107,7 @@ public:
     }
 
     x_ = x_mean;
-    P_ = 0.5 * (P + P.transpose()); // симметризация
+    P_ = 0.5 * (P + P.transpose());
   }
 
   void update(const Eigen::VectorXd & z, const IMeasurementModel & model) override
@@ -103,51 +117,56 @@ public:
     }
 
     constexpr int NX = 12;
-    constexpr int NA = NX;
     const int nz = model.measurementDim();
 
-    const double lambda = params_.alpha * params_.alpha * (NA + params_.kappa) - NA;
+    const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
 
     Eigen::Matrix<double, NX, NX> Pj = P_;
     Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
-    Eigen::Matrix<double, NX, NX> L = ((NA + lambda) * Pj).llt().matrixL();
+    Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
 
-    std::vector<double> Wm(2 * NA + 1), Wc(2 * NA + 1);
-    computeWeights(NA, lambda, Wm, Wc);
+    std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
+    computeWeights(NX, lambda, Wm, Wc);
 
-    std::vector<State> sigma_x(2 * NA + 1);
+    // 1) sigma points in state space
+    std::vector<State> sigma_x(2 * NX + 1);
     sigma_x[0] = x_;
-
-    for (int i = 0; i < NA; ++i) {
+    for (int i = 0; i < NX; ++i) {
       sigma_x[i + 1] = StateOps::boxPlus(x_, L.col(i));
-      sigma_x[i + 1 + NA] = StateOps::boxPlus(x_, -L.col(i));
+      sigma_x[i + 1 + NX] = StateOps::boxPlus(x_, -L.col(i));
     }
 
-    std::vector<Eigen::VectorXd> sigma_z(2 * NA + 1, Eigen::VectorXd(nz));
-    for (int i = 0; i < 2 * NA + 1; ++i) {
+    // 2) propagate through measurement model
+    std::vector<Eigen::VectorXd> sigma_z(2 * NX + 1, Eigen::VectorXd(nz));
+    for (int i = 0; i < 2 * NX + 1; ++i) {
       sigma_z[i] = model.predictMeasurement(sigma_x[i]);
     }
 
+    // 3) mean of predicted measurements
     Eigen::VectorXd z_mean = Eigen::VectorXd::Zero(nz);
-    for (int i = 0; i < 2 * NA + 1; ++i) {
+    for (int i = 0; i < 2 * NX + 1; ++i) {
       z_mean += Wm[i] * sigma_z[i];
     }
 
+    // 4) innovation covariance and cross-covariance
     Eigen::MatrixXd S = Eigen::MatrixXd::Zero(nz, nz);
     Eigen::MatrixXd Pxz = Eigen::MatrixXd::Zero(NX, nz);
 
-    for (int i = 0; i < 2 * NA + 1; ++i) {
+    for (int i = 0; i < 2 * NX + 1; ++i) {
       ErrorVec dx = StateOps::boxMinus(sigma_x[i], x_);
       Eigen::VectorXd dz = sigma_z[i] - z_mean;
+
       S += Wc[i] * dz * dz.transpose();
       Pxz += Wc[i] * dx * dz.transpose();
     }
 
     S += model.measurementCov();
 
+    // 5) Kalman gain
     Eigen::MatrixXd K = Pxz * S.ldlt().solve(Eigen::MatrixXd::Identity(nz, nz));
     ErrorVec dx = K * (z - z_mean);
 
+    // 6) update state and covariance
     x_ = StateOps::boxPlus(x_, dx);
     P_ = P_ - K * S * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());

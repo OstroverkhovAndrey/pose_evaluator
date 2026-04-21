@@ -1,7 +1,7 @@
 /pose_evaluator_node:
   ros__parameters:
-    camera_filter_type: ukf
-    object_filter_type: ukf
+    camera_filter_type: simple
+    object_filter_type: simple
     qos_overrides:
       /parameter_events:
         publisher:
