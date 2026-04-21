@@ -1,0 +1,17 @@
+/latest_image_publisher_node:
+  ros__parameters:
+    camera_height: 480
+    camera_id: 0
+    camera_width: 640
+    output_topic: /output_image
+    publish_frequency: 30
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    start_type_description_service: true
+    use_sim_time: false
+
