@@ -13,7 +13,7 @@
 
 #include "pose_evaluator/msg/detected_points.hpp"
 #include "pose_evaluator/filter_factory.hpp"
-#include "pose_evaluator/white_noise_rigid_body_model.hpp"
+#include "pose_evaluator/random_accel_process_model.hpp"
 #include "pose_evaluator/camera_pinhole_measurement_model.hpp"
 #include "pose_evaluator/object_pinhole_measurement_model.hpp"
 #include "pose_evaluator/so3_utils.hpp"
@@ -28,7 +28,7 @@ using pose_evaluator::CameraPinholeMeasurementModel;
 using pose_evaluator::ObjectPinholeMeasurementModel;
 using pose_evaluator::makeCameraFilter;
 using pose_evaluator::makeObjectFilter;
-using pose_evaluator::WhiteNoiseRigidBodyModel;
+using pose_evaluator::RandomAccelProcessModel;
 
 class PoseEvaluatorNode : public rclcpp::Node
 {
@@ -70,7 +70,7 @@ private:
       return it->second;
     }
 
-    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    auto process_model = std::make_shared<RandomAccelProcessModel>();
     TrackedEntity entity;
     entity.filter = makeCameraFilter(camera_filter_type_, process_model);
     auto [new_it, inserted] = camera_entities_.emplace(camera_id, std::move(entity));
@@ -85,7 +85,7 @@ private:
       return it->second;
     }
 
-    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    auto process_model = std::make_shared<RandomAccelProcessModel>();
     TrackedEntity entity;
     entity.filter = makeObjectFilter(object_filter_type_, process_model);
     auto [new_it, inserted] = object_entities_.emplace(object_id, std::move(entity));

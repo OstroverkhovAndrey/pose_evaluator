@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <vector>
+#include <random>
 #include <stdexcept>
 
 namespace pose_evaluator
@@ -20,6 +21,8 @@ public:
     double kappa{0.0};
     int mean_iterations{6};
     double jitter{1e-9};
+    double sigma_a{1e-5};
+    double sigma_alpha{1e-5};
   };
 
   explicit UnscentedKalmanFilter(std::shared_ptr<IProcessModel> process_model)
@@ -53,48 +56,44 @@ public:
       return;
     }
 
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::normal_distribution<double> ga(0.0, params_.sigma_a);
+    std::normal_distribution<double> galpha(0.0, params_.sigma_alpha);
+
+    Eigen::Vector3d a(ga(gen), ga(gen), ga(gen));
+    Eigen::Vector3d alpha(galpha(gen), galpha(gen), galpha(gen));
+    ProcessNoiseVec a_alpha;
+    a_alpha << a, alpha;
+
     constexpr int NX = 12;
-    constexpr int NW = 6;
-    constexpr int NA = NX + NW;
+    const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
 
-    const double lambda = params_.alpha * params_.alpha * (NA + params_.kappa) - NA;
+    Eigen::Matrix<double, NX, NX> Pj = P_;
+    Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
+    Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
 
-    Eigen::Matrix<double, NA, NA> P_aug = Eigen::Matrix<double, NA, NA>::Zero();
-    P_aug.block<12,12>(0,0) = P_;
-    P_aug.block<6,6>(12,12) = process_model_->noiseCov(dt);
-    P_aug += params_.jitter * Eigen::Matrix<double, NA, NA>::Identity();
+    std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
+    computeWeights(NX, lambda, Wm, Wc);
 
-    Eigen::Matrix<double, NA, NA> L = ((NA + lambda) * P_aug).llt().matrixL();
+    std::vector<State> sigma_pred(2 * NX + 1);
+    sigma_pred[0] = process_model_->propagate(x_, a_alpha, dt); // центральная
 
-    std::vector<double> Wm(2 * NA + 1), Wc(2 * NA + 1);
-    computeWeights(NA, lambda, Wm, Wc);
-
-    std::vector<State> sigma_pred(2 * NA + 1);
-
-    auto propagateSigma = [&](const Eigen::Matrix<double, NA, 1> & delta) {
-      ErrorVec dx = delta.template segment<12>(0);
-      ProcessNoiseVec dw = delta.template segment<6>(12);
-      State sigma_state = StateOps::boxPlus(x_, dx);
-      return process_model_->propagate(sigma_state, dw, dt);
-    };
-
-    sigma_pred[0] = propagateSigma(Eigen::Matrix<double, NA, 1>::Zero());
-
-    for (int i = 0; i < NA; ++i) {
-      sigma_pred[i + 1] = propagateSigma(L.col(i));
-      sigma_pred[i + 1 + NA] = propagateSigma(-L.col(i));
+    for (int i = 0; i < NX; ++i) {
+      ErrorVec dxi = L.col(i);
+      sigma_pred[i + 1]      = process_model_->propagate(StateOps::boxPlus(x_, dxi), a_alpha, dt);
+      sigma_pred[i + 1 + NX] = process_model_->propagate(StateOps::boxPlus(x_, -dxi), a_alpha, dt);
     }
 
     State x_mean = computeStateMean(sigma_pred, Wm);
 
     Cov12 P = Cov12::Zero();
-    for (int i = 0; i < 2 * NA + 1; ++i) {
+    for (int i = 0; i < 2 * NX + 1; ++i) {
       ErrorVec dx = StateOps::boxMinus(sigma_pred[i], x_mean);
       P += Wc[i] * dx * dx.transpose();
     }
 
     x_ = x_mean;
-    P_ = 0.5 * (P + P.transpose());
+    P_ = 0.5 * (P + P.transpose()); // симметризация
   }
 
   void update(const Eigen::VectorXd & z, const IMeasurementModel & model) override
