@@ -41,6 +41,17 @@ target_link_libraries(
   cv_bridge::cv_bridge 
   camera_info_manager::camera_info_manager 
   "${cpp_typesupport_target}")
+
+add_executable(image_stream_publisher src/image_publisher/image_stream_publisher.cpp)
+target_link_libraries(
+  image_stream_publisher PUBLIC 
+  rclcpp::rclcpp 
+  ${std_msgs_TARGETS} 
+  ${sensor_msgs_TARGETS} 
+  ${OpenCV_LIBS} 
+  cv_bridge::cv_bridge 
+  camera_info_manager::camera_info_manager 
+  "${cpp_typesupport_target}")
  
 add_executable(image_extractor src/image_extractor/image_extractor.cpp)
 target_link_libraries(
@@ -72,6 +83,7 @@ target_link_libraries(pose_evaluator_node PUBLIC rclcpp::rclcpp ${std_msgs_TARGE
 
 install(TARGETS 
   image_publisher
+  image_stream_publisher
   image_extractor
   latest_image_publisher_node
   aruco_detector_node
