@@ -75,7 +75,6 @@ public:
 
         declare_parameters();
         get_parameters();
-        return;
 
         publisher_ = this->create_publisher<sensor_msgs::msg::Image>(output_topic_, 10);
 
