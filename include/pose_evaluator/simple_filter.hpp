@@ -116,7 +116,7 @@ private:
     // solvePnP gives world in camera: Xc = R_cw Xw + t_cw
     // We want camera in world:
     const Eigen::Matrix3d R_wc = R_cw.transpose();
-    const Eigen::Vector3d p_wc = -R_wc * t_cw;
+    const Eigen::Vector3d p_wc = - t_cw;
 
     x_.q = Eigen::Quaterniond(R_wc).normalized();
     x_.p = p_wc;
