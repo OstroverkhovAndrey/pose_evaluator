@@ -187,6 +187,7 @@ private:
         detected_points_msg.header = msg->header;
         detected_points_msg.camera_info = msg->camera_info;
         detected_points_msg.points = points;
+        detected_points_msg.camera_id = "camera_1";
         markers_publisher_->publish(detected_points_msg);
     }
 
