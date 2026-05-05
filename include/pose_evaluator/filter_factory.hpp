@@ -17,7 +17,8 @@ inline std::unique_ptr<IFilter> makeCameraFilter(
   std::shared_ptr<IProcessModel> process_model)
 {
   if (type == "ukf") {
-    return std::make_unique<UnscentedKalmanFilter>(process_model);
+    UnscentedKalmanFilter::Params params;
+    return std::make_unique<UnscentedKalmanFilter>(process_model, params);
   }
 
   if (type == "simple") {
@@ -32,7 +33,8 @@ inline std::unique_ptr<IFilter> makeObjectFilter(
   std::shared_ptr<IProcessModel> process_model)
 {
   if (type == "ukf") {
-    return std::make_unique<UnscentedKalmanFilter>(process_model);
+    UnscentedKalmanFilter::Params params;
+    return std::make_unique<UnscentedKalmanFilter>(process_model, params);
   }
 
   if (type == "simple") {

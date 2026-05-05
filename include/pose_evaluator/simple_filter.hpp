@@ -5,7 +5,6 @@
 #include "pose_evaluator/object_pinhole_measurement_model.hpp"
 
 #include <opencv2/opencv.hpp>
-#include <stdexcept>
 
 namespace pose_evaluator
 {
@@ -15,8 +14,8 @@ class SimpleFilter : public IFilter
 public:
   enum class Mode
   {
-    CameraInWorld,   // filter estimates T_wc using world points
-    ObjectInWorld    // filter estimates T_wo using object points + current camera pose
+    CameraInWorld,
+    ObjectInWorld
   };
 
   explicit SimpleFilter(Mode mode)
@@ -37,7 +36,7 @@ public:
 
   void predict(double /*dt*/) override
   {
-    // no prediction
+    // No prediction step
   }
 
   void update(const Eigen::VectorXd &, const IMeasurementModel & model) override
@@ -70,13 +69,13 @@ private:
       return;
     }
 
-    std::vector<cv::Point3f> object_points;
+    std::vector<cv::Point3f> world_points;
     std::vector<cv::Point2f> image_points;
-    object_points.reserve(obs.size());
+    world_points.reserve(obs.size());
     image_points.reserve(obs.size());
 
     for (const auto & o : obs) {
-      object_points.emplace_back(
+      world_points.emplace_back(
         static_cast<float>(o.point_world.x()),
         static_cast<float>(o.point_world.y()),
         static_cast<float>(o.point_world.z()));
@@ -92,8 +91,7 @@ private:
 
     cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
     cv::Mat rvec, tvec;
-
-    const bool ok = cv::solvePnP(object_points, image_points, camera_matrix, dist, rvec, tvec);
+    const bool ok = cv::solvePnP(world_points, image_points, camera_matrix, dist, rvec, tvec);
     if (!ok) {
       return;
     }
@@ -108,15 +106,13 @@ private:
       }
     }
 
-    Eigen::Vector3d tvec_e(
+    Eigen::Vector3d t_cw(
       tvec.at<double>(0, 0),
       tvec.at<double>(1, 0),
       tvec.at<double>(2, 0));
 
-    // solvePnP gives world in camera: Xc = R_cw Xw + t_cw
-    // We want camera in world:
-    const Eigen::Matrix3d R_wc = R_cw.transpose();
-    const Eigen::Vector3d p_wc = - R_wc * tvec_e;
+    Eigen::Matrix3d R_wc = R_cw.transpose();
+    Eigen::Vector3d p_wc = -R_wc * t_cw;
 
     x_.q = Eigen::Quaterniond(R_wc).normalized();
     x_.p = p_wc;
@@ -162,7 +158,6 @@ private:
 
     cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
     cv::Mat rvec, tvec;
-
     const bool ok = cv::solvePnP(object_points, image_points, camera_matrix, dist, rvec, tvec);
     if (!ok) {
       return;
@@ -178,24 +173,14 @@ private:
       }
     }
 
-    const Eigen::Vector3d t_co(
+    Eigen::Vector3d t_co(
       tvec.at<double>(0, 0),
       tvec.at<double>(1, 0),
       tvec.at<double>(2, 0));
 
-    // solvePnP gives object in camera:
-    // Xc = R_co Xo + t_co
-    //
-    // camera filter stores camera in world:
-    // Xw = R_wc Xc + p_wc
-    //
-    // Therefore object in world:
-    // R_wo = R_wc R_co
-    // p_wo = R_wc t_co + p_wc
-
     const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
     const Eigen::Matrix3d R_wo = R_wc * R_co;
-    const Eigen::Vector3d p_wo = R_wc * t_co + camera_state.p;
+    const Eigen::Vector3d p_wo = camera_state.p + R_wc * t_co;
 
     x_.q = Eigen::Quaterniond(R_wo).normalized();
     x_.p = p_wo;

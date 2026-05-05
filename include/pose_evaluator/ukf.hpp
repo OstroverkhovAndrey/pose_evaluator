@@ -5,7 +5,6 @@
 
 #include <memory>
 #include <vector>
-#include <random>
 #include <stdexcept>
 
 namespace pose_evaluator
@@ -16,19 +15,10 @@ class UnscentedKalmanFilter : public IFilter
 public:
   struct Params
   {
-    double alpha{1e-2};
-    double beta{2.0};
     double kappa{0.0};
     int mean_iterations{6};
     double jitter{1e-9};
-
-    // stddev of sampled linear/angular accelerations at each predict step
-    double sigma_a{1e-5};
-    double sigma_alpha{1e-5};
   };
-
-  explicit UnscentedKalmanFilter(std::shared_ptr<IProcessModel> process_model)
-  : UnscentedKalmanFilter(std::move(process_model), Params()) {}
 
   UnscentedKalmanFilter(
     std::shared_ptr<IProcessModel> process_model,
@@ -54,54 +44,47 @@ public:
 
   void predict(double dt) override
   {
-    return;
-
     if (!initialized_) {
       return;
     }
 
-    // 1) Sample one process noise vector for this whole predict step
-    static thread_local std::mt19937 gen(std::random_device{}());
-    std::normal_distribution<double> ga(0.0, params_.sigma_a);
-    std::normal_distribution<double> galpha(0.0, params_.sigma_alpha);
-
-    Eigen::Vector3d a(ga(gen), ga(gen), ga(gen));
-    Eigen::Vector3d alpha(galpha(gen), galpha(gen), galpha(gen));
-
-    ProcessNoiseVec sampled_noise;
-    sampled_noise << a, alpha;
-
-    // 2) Sigma points only over the state error
     constexpr int NX = 12;
-    const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
+    constexpr int NW = 6;
+    constexpr int NA = NX + NW;
 
-    Eigen::Matrix<double, NX, NX> Pj = P_;
-    Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
+    const double lambda = params_.kappa;
 
-    Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
+    Eigen::Matrix<double, NA, NA> P_aug = Eigen::Matrix<double, NA, NA>::Zero();
+    P_aug.block<12,12>(0,0) = P_;
+    P_aug.block<6,6>(12,12) = process_model_->noiseCov(dt);
+    P_aug += params_.jitter * Eigen::Matrix<double, NA, NA>::Identity();
 
-    std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
-    computeWeights(NX, lambda, Wm, Wc);
+    Eigen::Matrix<double, NA, NA> L = ((NA + lambda) * P_aug).llt().matrixL();
 
-    // 3) Propagate all sigma points with the same sampled process noise
-    std::vector<State> sigma_pred(2 * NX + 1);
+    std::vector<double> Wm(2 * NA + 1), Wc(2 * NA + 1);
+    computeWeights(NA, lambda, Wm, Wc);
 
-    sigma_pred[0] = process_model_->propagate(x_, sampled_noise, dt);
+    std::vector<State> sigma_pred(2 * NA + 1);
 
-    for (int i = 0; i < NX; ++i) {
-      ErrorVec dxi = L.col(i);
-      sigma_pred[i + 1] =
-        process_model_->propagate(StateOps::boxPlus(x_, dxi), sampled_noise, dt);
-      sigma_pred[i + 1 + NX] =
-        process_model_->propagate(StateOps::boxPlus(x_, -dxi), sampled_noise, dt);
+    auto propagateSigma = [&](const Eigen::Matrix<double, NA, 1> & delta) {
+      ErrorVec dx = delta.template segment<12>(0);
+      ProcessNoiseVec dw = delta.template segment<6>(12);
+
+      State sigma_state = StateOps::boxPlus(x_, dx);
+      return process_model_->propagate(sigma_state, dw, dt);
+    };
+
+    sigma_pred[0] = propagateSigma(Eigen::Matrix<double, NA, 1>::Zero());
+
+    for (int i = 0; i < NA; ++i) {
+      sigma_pred[i + 1] = propagateSigma(L.col(i));
+      sigma_pred[i + 1 + NA] = propagateSigma(-L.col(i));
     }
 
-    // 4) Mean of propagated sigma points
     State x_mean = computeStateMean(sigma_pred, Wm);
 
-    // 5) Covariance from propagated sigma points
     Cov12 P = Cov12::Zero();
-    for (int i = 0; i < 2 * NX + 1; ++i) {
+    for (int i = 0; i < 2 * NA + 1; ++i) {
       ErrorVec dx = StateOps::boxMinus(sigma_pred[i], x_mean);
       P += Wc[i] * dx * dx.transpose();
     }
@@ -115,72 +98,57 @@ public:
     if (!initialized_) {
       return;
     }
-  
+
     constexpr int NX = 12;
     const int nz = model.measurementDim();
-  
-    const double lambda = params_.alpha * params_.alpha * (NX + params_.kappa) - NX;
-  
-    // 1. Построение сигма-точек вокруг текущего состояния
+
+    const double lambda = params_.kappa;
+
     Eigen::Matrix<double, NX, NX> Pj = P_;
     Pj += params_.jitter * Eigen::Matrix<double, NX, NX>::Identity();
-  
+
     Eigen::Matrix<double, NX, NX> L = ((NX + lambda) * Pj).llt().matrixL();
-  
+
     std::vector<double> Wm(2 * NX + 1), Wc(2 * NX + 1);
     computeWeights(NX, lambda, Wm, Wc);
-  
+
     std::vector<State> sigma_x(2 * NX + 1);
     sigma_x[0] = x_;
-  
     for (int i = 0; i < NX; ++i) {
       sigma_x[i + 1]      = StateOps::boxPlus(x_,  L.col(i));
       sigma_x[i + 1 + NX] = StateOps::boxPlus(x_, -L.col(i));
     }
-  
-    // 2. Среднее состояние по сигма-точкам
+
     State x_mean = computeStateMean(sigma_x, Wm);
-  
-    // 3. Прогон сигма-точек через модель измерения
+
     std::vector<Eigen::VectorXd> sigma_z(2 * NX + 1, Eigen::VectorXd(nz));
     for (int i = 0; i < 2 * NX + 1; ++i) {
       sigma_z[i] = model.predictMeasurement(sigma_x[i]);
     }
-  
-    // 4. Среднее предсказанное измерение
+
     Eigen::VectorXd z_mean = Eigen::VectorXd::Zero(nz);
     for (int i = 0; i < 2 * NX + 1; ++i) {
       z_mean += Wm[i] * sigma_z[i];
     }
-  
-    // 5. Ковариация измерения и кросс-ковариация
-    Eigen::MatrixXd S   = Eigen::MatrixXd::Zero(nz, nz);
+
+    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(nz, nz);
     Eigen::MatrixXd Pxz = Eigen::MatrixXd::Zero(NX, nz);
-  
+
     for (int i = 0; i < 2 * NX + 1; ++i) {
       ErrorVec dx = StateOps::boxMinus(sigma_x[i], x_mean);
       Eigen::VectorXd dz = sigma_z[i] - z_mean;
-    
+
       S   += Wc[i] * dz * dz.transpose();
       Pxz += Wc[i] * dx * dz.transpose();
     }
-  
-    // 6. Добавляем шум измерения
+
     S += model.measurementCov();
-  
-    // 7. Коэффициент Калмана
+
     Eigen::MatrixXd K = Pxz * S.ldlt().solve(Eigen::MatrixXd::Identity(nz, nz));
-  
-    // 8. Инновация
     Eigen::VectorXd innovation = z - z_mean;
-  
-    // 9. Поправка в пространстве ошибок
     ErrorVec dx_corr = K * innovation;
-  
-    // 10. Обновление состояния
+
     x_ = StateOps::boxPlus(x_mean, dx_corr);
-  
-    // 11. Обновление ковариации
     P_ = P_ - K * S * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());
   }
@@ -196,7 +164,7 @@ private:
     std::vector<double> & Wc) const
   {
     Wm[0] = lambda / (n + lambda);
-    Wc[0] = Wm[0] + (1.0 - params_.alpha * params_.alpha + params_.beta);
+    Wc[0] = Wm[0];
 
     for (int i = 1; i < 2 * n + 1; ++i) {
       Wm[i] = 1.0 / (2.0 * (n + lambda));
