@@ -278,7 +278,7 @@ private:
         detected_points_msg.header.stamp = cur_now;
         detected_points_msg.header.frame_id = camera_params_.camera_id;
         // detected_points_msg.camera_info = msg->camera_info;
-        detected_points_msg.camera_id = camera_params_.camera_id;
+        detected_points_msg.camera_id = std::to_string(camera_params_.camera_id);
         detected_points_msg.points = points;
         markers_publisher_->publish(detected_points_msg);
     }
