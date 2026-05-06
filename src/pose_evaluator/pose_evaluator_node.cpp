@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <deque>
+#include <algorithm>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -18,7 +20,6 @@
 #include "pose_evaluator/white_noise_rigid_body_model.hpp"
 #include "pose_evaluator/camera_pinhole_measurement_model.hpp"
 #include "pose_evaluator/object_pinhole_measurement_model.hpp"
-#include "pose_evaluator/so3_utils.hpp"
 
 using pose_evaluator::State;
 using pose_evaluator::Cov12;
@@ -38,19 +39,14 @@ public:
   PoseEvaluatorNode()
   : Node("pose_evaluator_node")
   {
-    // Выбор реализации фильтра:
-    // ukf / simple
     camera_filter_type_ = declare_parameter<std::string>("camera_filter_type", "ukf");
     object_filter_type_ = declare_parameter<std::string>("object_filter_type", "ukf");
 
-    // Параметры модели процесса:
-    // ускорения считаются белым шумом с дисперсией sigma_a^2 и sigma_alpha^2
     sigma_a_ = declare_parameter<double>("sigma_a", 1e-5);
     sigma_alpha_ = declare_parameter<double>("sigma_alpha", 1e-5);
-
-    // Шум измерения в пикселях:
-    // z = h(x) + v,   v ~ N(0, sigma_px^2 I)
     sigma_px_ = declare_parameter<double>("sigma_px", 1.0);
+
+    history_size_ = declare_parameter<int>("history_size", 100);
 
     detections_sub_ = create_subscription<pose_evaluator::msg::DetectedPoints>(
       "detected_points",
@@ -62,36 +58,55 @@ public:
   }
 
 private:
+  struct FilterSnapshot
+  {
+    rclcpp::Time stamp;
+    State state;
+    Cov12 covariance;
+  };
+
+  struct CameraMeasurementRecord
+  {
+    rclcpp::Time stamp;
+    CameraIntrinsics K;
+    std::vector<WorldPointObservation> observations;
+  };
+
+  struct ObjectMeasurementRecord
+  {
+    rclcpp::Time stamp;
+    CameraIntrinsics K;
+    State camera_state_at_measurement;
+    std::vector<ObjectPointObservation> observations;
+  };
+
+  template<typename MeasurementRecordT>
   struct TrackedEntity
   {
     std::unique_ptr<IFilter> filter;
     rclcpp::Time last_stamp{0, 0, RCL_ROS_TIME};
 
-    // Для публикации скорости через численное дифференцирование
-    Eigen::Vector3d last_position = Eigen::Vector3d::Zero();
-    Eigen::Quaterniond last_orientation{1.0, 0.0, 0.0, 0.0};
-    rclcpp::Time last_output_stamp{0, 0, RCL_ROS_TIME};
-    bool last_output_valid{false};
+    // История состояний и измерений для поддержки отката
+    std::deque<FilterSnapshot> snapshots;
+    std::deque<MeasurementRecordT> measurements;
   };
+
+  using CameraEntity = TrackedEntity<CameraMeasurementRecord>;
+  using ObjectEntity = TrackedEntity<ObjectMeasurementRecord>;
 
   // ------------------------------------------------------------
   // Создание / получение фильтра камеры
   // ------------------------------------------------------------
-  TrackedEntity & getOrCreateCameraEntity(const std::string & camera_id)
+  CameraEntity & getOrCreateCameraEntity(const std::string & camera_id)
   {
     auto it = camera_entities_.find(camera_id);
     if (it != camera_entities_.end()) {
       return it->second;
     }
 
-    // Модель процесса:
-    // p_{k+1} = p_k + v_k dt + 1/2 a_k dt^2
-    // v_{k+1} = v_k + a_k dt
-    // q_{k+1} = Exp(dtheta) * q_k
-    // w_{k+1} = w_k + alpha_k dt
     auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
 
-    TrackedEntity entity;
+    CameraEntity entity;
     entity.filter = makeCameraFilter(camera_filter_type_, process_model);
 
     auto [new_it, inserted] = camera_entities_.emplace(camera_id, std::move(entity));
@@ -102,7 +117,7 @@ private:
   // ------------------------------------------------------------
   // Создание / получение фильтра объекта
   // ------------------------------------------------------------
-  TrackedEntity & getOrCreateObjectEntity(const std::string & object_id)
+  ObjectEntity & getOrCreateObjectEntity(const std::string & object_id)
   {
     auto it = object_entities_.find(object_id);
     if (it != object_entities_.end()) {
@@ -111,7 +126,7 @@ private:
 
     auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
 
-    TrackedEntity entity;
+    ObjectEntity entity;
     entity.filter = makeObjectFilter(object_filter_type_, process_model);
 
     auto [new_it, inserted] = object_entities_.emplace(object_id, std::move(entity));
@@ -120,8 +135,7 @@ private:
   }
 
   // ------------------------------------------------------------
-  // Извлечение внутренних параметров камеры
-  // K = [ fx 0 cx ; 0 fy cy ; 0 0 1 ]
+  // Внутренние параметры камеры из CameraInfo
   // ------------------------------------------------------------
   static CameraIntrinsics intrinsicsFromCameraInfo(const sensor_msgs::msg::CameraInfo & info)
   {
@@ -133,21 +147,40 @@ private:
     return K;
   }
 
+  void trimSnapshots(std::deque<FilterSnapshot> & snapshots)
+  {
+    while (static_cast<int>(snapshots.size()) > history_size_) {
+      snapshots.pop_front();
+    }
+  }
+
+  template<typename T>
+  void trimMeasurements(std::deque<T> & measurements)
+  {
+    while (static_cast<int>(measurements.size()) > history_size_) {
+      measurements.pop_front();
+    }
+  }
+
+  template<typename T>
+  void insertMeasurementSorted(std::deque<T> & measurements, const T & m)
+  {
+    auto it = std::upper_bound(
+      measurements.begin(), measurements.end(), m.stamp,
+      [](const rclcpp::Time & t, const T & rec) { return t < rec.stamp; });
+
+    measurements.insert(it, m);
+  }
+
   // ------------------------------------------------------------
-  // Инициализация состояния камеры через solvePnP
-  //
-  // solvePnP даёт:
-  //   X_c = R_cw X_w + t_cw
-  //
-  // Фильтр хранит:
-  //   X_w = R_wc X_c + p_wc
-  //
-  // Поэтому:
+  // Инициализация фильтра камеры через solvePnP
+  // solvePnP: X_c = R_cw X_w + t_cw
+  // Фильтр хранит camera in world:
   //   R_wc = R_cw^T
   //   p_wc = -R_cw^T t_cw
   // ------------------------------------------------------------
   bool initializeCameraFilterFromPnP(
-    TrackedEntity & entity,
+    CameraEntity & entity,
     const CameraIntrinsics & K,
     const std::vector<WorldPointObservation> & observations)
   {
@@ -157,17 +190,9 @@ private:
 
     std::vector<cv::Point3f> world_points;
     std::vector<cv::Point2f> image_points;
-    world_points.reserve(observations.size());
-    image_points.reserve(observations.size());
-
     for (const auto & obs : observations) {
-      world_points.emplace_back(
-        static_cast<float>(obs.point_world.x()),
-        static_cast<float>(obs.point_world.y()),
-        static_cast<float>(obs.point_world.z()));
-      image_points.emplace_back(
-        static_cast<float>(obs.pixel.x()),
-        static_cast<float>(obs.pixel.y()));
+      world_points.emplace_back(obs.point_world.x(), obs.point_world.y(), obs.point_world.z());
+      image_points.emplace_back(obs.pixel.x(), obs.pixel.y());
     }
 
     cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
@@ -198,8 +223,8 @@ private:
       tvec.at<double>(1, 0),
       tvec.at<double>(2, 0));
 
-    const Eigen::Matrix3d R_wc = R_cw.transpose();
-    const Eigen::Vector3d p_wc = -R_wc * t_cw;
+    Eigen::Matrix3d R_wc = R_cw.transpose();
+    Eigen::Vector3d p_wc = -R_wc * t_cw;
 
     State x0;
     x0.p = p_wc;
@@ -218,20 +243,16 @@ private:
   }
 
   // ------------------------------------------------------------
-  // Инициализация объекта через solvePnP
-  //
-  // solvePnP даёт object->camera:
-  //   X_c = R_co X_o + t_co
-  //
+  // Инициализация фильтра объекта через solvePnP
+  // solvePnP: X_c = R_co X_o + t_co
   // Камера в мире:
   //   X_w = R_wc X_c + p_wc
-  //
   // Следовательно:
   //   R_wo = R_wc R_co
   //   p_wo = p_wc + R_wc t_co
   // ------------------------------------------------------------
   bool initializeObjectFilterFromPnP(
-    TrackedEntity & entity,
+    ObjectEntity & entity,
     const CameraIntrinsics & K,
     const State & camera_state,
     const std::vector<ObjectPointObservation> & observations)
@@ -242,17 +263,9 @@ private:
 
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
-    object_points.reserve(observations.size());
-    image_points.reserve(observations.size());
-
     for (const auto & obs : observations) {
-      object_points.emplace_back(
-        static_cast<float>(obs.point_object.x()),
-        static_cast<float>(obs.point_object.y()),
-        static_cast<float>(obs.point_object.z()));
-      image_points.emplace_back(
-        static_cast<float>(obs.pixel.x()),
-        static_cast<float>(obs.pixel.y()));
+      object_points.emplace_back(obs.point_object.x(), obs.point_object.y(), obs.point_object.z());
+      image_points.emplace_back(obs.pixel.x(), obs.pixel.y());
     }
 
     cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
@@ -303,94 +316,175 @@ private:
     return true;
   }
 
-  // ------------------------------------------------------------
-  // Обновление фильтра камеры
-  // Измерительная модель:
-  //   X_c = R_wc^T (X_w - p_wc)
-  //   z = h_c(x_c)
-  // ------------------------------------------------------------
-  void updateCameraEntity(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const std::vector<WorldPointObservation> & observations,
-    const rclcpp::Time & stamp)
+  void saveSnapshot(CameraEntity & entity, const rclcpp::Time & stamp)
   {
-    if (observations.size() < 4) {
-      return;
-    }
-
     if (!entity.filter->isInitialized()) {
-      if (initializeCameraFilterFromPnP(entity, K, observations)) {
-        entity.last_stamp = stamp;
-      }
       return;
     }
+    entity.snapshots.push_back(FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+    trimSnapshots(entity.snapshots);
+  }
 
-    double dt = 0.0;
-    if (entity.last_stamp.nanoseconds() != 0) {
-      dt = (stamp - entity.last_stamp).seconds();
-      if (dt < 0.0) {
-        dt = 0.0;
-      }
+  void saveSnapshot(ObjectEntity & entity, const rclcpp::Time & stamp)
+  {
+    if (!entity.filter->isInitialized()) {
+      return;
     }
-    entity.last_stamp = stamp;
+    entity.snapshots.push_back(FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+    trimSnapshots(entity.snapshots);
+  }
 
-    entity.filter->predict(dt);
+  bool restoreSnapshot(CameraEntity & entity, const FilterSnapshot & snapshot)
+  {
+    entity.filter->initialize(snapshot.state, snapshot.covariance);
+    entity.last_stamp = snapshot.stamp;
+    return true;
+  }
 
-    CameraPinholeMeasurementModel model(K, observations, sigma_px_);
-    const Eigen::VectorXd z = model.measurementVector();
-
-    entity.filter->update(z, model);
+  bool restoreSnapshot(ObjectEntity & entity, const FilterSnapshot & snapshot)
+  {
+    entity.filter->initialize(snapshot.state, snapshot.covariance);
+    entity.last_stamp = snapshot.stamp;
+    return true;
   }
 
   // ------------------------------------------------------------
-  // Обновление фильтра объекта
-  // Измерительная модель:
-  //   X_w = R_wo X_o + p_wo
-  //   X_c = R_wc^T (X_w - p_wc)
-  //   z = h_o(x_o; x_c)
+  // Применение одного измерения камеры
   // ------------------------------------------------------------
-  void updateObjectEntity(
-    TrackedEntity & entity,
-    const CameraIntrinsics & K,
-    const State & camera_state,
-    const std::vector<ObjectPointObservation> & observations,
-    const rclcpp::Time & stamp)
+  void applyCameraMeasurement(CameraEntity & entity, const CameraMeasurementRecord & rec)
   {
-    if (observations.size() < 4) {
+    if (rec.observations.size() < 4) {
       return;
     }
 
     if (!entity.filter->isInitialized()) {
-      if (initializeObjectFilterFromPnP(entity, K, camera_state, observations)) {
-        entity.last_stamp = stamp;
+      if (!initializeCameraFilterFromPnP(entity, rec.K, rec.observations)) {
+        return;
       }
+      entity.last_stamp = rec.stamp;
+      saveSnapshot(entity, rec.stamp);
       return;
     }
 
-    double dt = 0.0;
-    if (entity.last_stamp.nanoseconds() != 0) {
-      dt = (stamp - entity.last_stamp).seconds();
-      if (dt < 0.0) {
-        dt = 0.0;
-      }
+    double dt = (rec.stamp - entity.last_stamp).seconds();
+    if (dt < 0.0) {
+      dt = 0.0;
     }
-    entity.last_stamp = stamp;
 
     entity.filter->predict(dt);
 
-    ObjectPinholeMeasurementModel model(K, camera_state, observations, sigma_px_);
-    const Eigen::VectorXd z = model.measurementVector();
-
+    CameraPinholeMeasurementModel model(rec.K, rec.observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
     entity.filter->update(z, model);
+
+    entity.last_stamp = rec.stamp;
+    saveSnapshot(entity, rec.stamp);
+  }
+
+  // ------------------------------------------------------------
+  // Применение одного измерения объекта
+  // ------------------------------------------------------------
+  void applyObjectMeasurement(ObjectEntity & entity, const ObjectMeasurementRecord & rec)
+  {
+    if (rec.observations.size() < 4) {
+      return;
+    }
+
+    if (!entity.filter->isInitialized()) {
+      if (!initializeObjectFilterFromPnP(entity, rec.K, rec.camera_state_at_measurement, rec.observations)) {
+        return;
+      }
+      entity.last_stamp = rec.stamp;
+      saveSnapshot(entity, rec.stamp);
+      return;
+    }
+
+    double dt = (rec.stamp - entity.last_stamp).seconds();
+    if (dt < 0.0) {
+      dt = 0.0;
+    }
+
+    entity.filter->predict(dt);
+
+    ObjectPinholeMeasurementModel model(rec.K, rec.camera_state_at_measurement, rec.observations, sigma_px_);
+    Eigen::VectorXd z = model.measurementVector();
+    entity.filter->update(z, model);
+
+    entity.last_stamp = rec.stamp;
+    saveSnapshot(entity, rec.stamp);
+  }
+
+  // ------------------------------------------------------------
+  // Replay камеры при поступлении измерения из прошлого
+  // ------------------------------------------------------------
+  void replayCameraEntity(CameraEntity & entity, const rclcpp::Time & stamp)
+  {
+    if (entity.snapshots.empty()) {
+      return;
+    }
+
+    auto snapshot_it = entity.snapshots.begin();
+    for (auto it = entity.snapshots.begin(); it != entity.snapshots.end(); ++it) {
+      if (it->stamp <= stamp) {
+        snapshot_it = it;
+      } else {
+        break;
+      }
+    }
+
+    const FilterSnapshot base_snapshot = *snapshot_it;
+    restoreSnapshot(entity, base_snapshot);
+
+    while (!entity.snapshots.empty() && entity.snapshots.back().stamp > base_snapshot.stamp) {
+      entity.snapshots.pop_back();
+    }
+
+    for (const auto & rec : entity.measurements) {
+      if (rec.stamp > base_snapshot.stamp) {
+        applyCameraMeasurement(entity, rec);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Replay объекта при поступлении измерения из прошлого
+  // ------------------------------------------------------------
+  void replayObjectEntity(ObjectEntity & entity, const rclcpp::Time & stamp)
+  {
+    if (entity.snapshots.empty()) {
+      return;
+    }
+
+    auto snapshot_it = entity.snapshots.begin();
+    for (auto it = entity.snapshots.begin(); it != entity.snapshots.end(); ++it) {
+      if (it->stamp <= stamp) {
+        snapshot_it = it;
+      } else {
+        break;
+      }
+    }
+
+    const FilterSnapshot base_snapshot = *snapshot_it;
+    restoreSnapshot(entity, base_snapshot);
+
+    while (!entity.snapshots.empty() && entity.snapshots.back().stamp > base_snapshot.stamp) {
+      entity.snapshots.pop_back();
+    }
+
+    for (const auto & rec : entity.measurements) {
+      if (rec.stamp > base_snapshot.stamp) {
+        applyObjectMeasurement(entity, rec);
+      }
+    }
   }
 
   // ------------------------------------------------------------
   // Публикация состояния объекта
-  // Для простоты скорость публикуется через численную производную:
-  //   v ~ (p_k - p_{k-1}) / dt
+  // Скорости публикуются напрямую из состояния фильтра:
+  //   linear = x.v
+  //   angular = x.w
   // ------------------------------------------------------------
-  void publishObjectState(const std::string & object_id, TrackedEntity & entity, const rclcpp::Time & stamp)
+  void publishObjectState(const std::string & object_id, ObjectEntity & entity, const rclcpp::Time & stamp)
   {
     if (!entity.filter->isInitialized()) {
       return;
@@ -401,49 +495,38 @@ private:
     geometry_msgs::msg::PoseStamped pose_msg;
     pose_msg.header.stamp = stamp;
     pose_msg.header.frame_id = "world";
+
     pose_msg.pose.position.x = x.p.x();
     pose_msg.pose.position.y = x.p.y();
     pose_msg.pose.position.z = x.p.z();
+
     pose_msg.pose.orientation.x = x.q.x();
     pose_msg.pose.orientation.y = x.q.y();
     pose_msg.pose.orientation.z = x.q.z();
     pose_msg.pose.orientation.w = x.q.w();
+
     pose_pub_->publish(pose_msg);
 
     geometry_msgs::msg::TwistStamped twist_msg;
     twist_msg.header = pose_msg.header;
 
-    if (entity.last_output_valid) {
-      double dt = (stamp - entity.last_output_stamp).seconds();
-      if (dt > 1e-6) {
-        Eigen::Vector3d v = (x.p - entity.last_position) / dt;
-        twist_msg.twist.linear.x = v.x();
-        twist_msg.twist.linear.y = v.y();
-        twist_msg.twist.linear.z = v.z();
+    // Используем скорости прямо из состояния фильтра
+    twist_msg.twist.linear.x = x.v.x();
+    twist_msg.twist.linear.y = x.v.y();
+    twist_msg.twist.linear.z = x.v.z();
 
-        Eigen::Quaterniond dq = entity.last_orientation.conjugate() * x.q;
-        Eigen::Vector3d dtheta = pose_evaluator::quatLog(dq);
-        Eigen::Vector3d w = dtheta / dt;
-
-        twist_msg.twist.angular.x = w.x();
-        twist_msg.twist.angular.y = w.y();
-        twist_msg.twist.angular.z = w.z();
-      }
-    }
+    twist_msg.twist.angular.x = x.w.x();
+    twist_msg.twist.angular.y = x.w.y();
+    twist_msg.twist.angular.z = x.w.z();
 
     twist_pub_->publish(twist_msg);
-
-    entity.last_position = x.p;
-    entity.last_orientation = x.q;
-    entity.last_output_stamp = stamp;
-    entity.last_output_valid = true;
 
     (void)object_id;
   }
 
   // ------------------------------------------------------------
-  // Главный callback:
-  // 1. Разделение наблюдений на world и object
+  // Главный callback
+  // 1. Разделение входных точек на world / object
   // 2. Обновление фильтра камеры
   // 3. Обновление фильтров объектов
   // ------------------------------------------------------------
@@ -451,7 +534,6 @@ private:
   {
     const rclcpp::Time stamp = msg->header.stamp;
     const std::string camera_id = msg->camera_id;
-
     const CameraIntrinsics K = intrinsicsFromCameraInfo(msg->camera_info);
 
     std::vector<WorldPointObservation> world_obs;
@@ -471,9 +553,22 @@ private:
       }
     }
 
-    // Обновление фильтра камеры
+    // ---------- Камера ----------
     auto & camera_entity = getOrCreateCameraEntity(camera_id);
-    updateCameraEntity(camera_entity, K, world_obs, stamp);
+
+    CameraMeasurementRecord camera_rec;
+    camera_rec.stamp = stamp;
+    camera_rec.K = K;
+    camera_rec.observations = world_obs;
+
+    insertMeasurementSorted(camera_entity.measurements, camera_rec);
+    trimMeasurements(camera_entity.measurements);
+
+    if (!camera_entity.filter->isInitialized() || stamp >= camera_entity.last_stamp) {
+      applyCameraMeasurement(camera_entity, camera_rec);
+    } else {
+      replayCameraEntity(camera_entity, stamp);
+    }
 
     if (!camera_entity.filter->isInitialized()) {
       return;
@@ -481,12 +576,26 @@ private:
 
     const State camera_state = camera_entity.filter->state();
 
-    // Обновление фильтров объектов
+    // ---------- Объекты ----------
     for (auto & kv : object_obs_map) {
       const std::string & object_id = kv.first;
       auto & object_entity = getOrCreateObjectEntity(object_id);
 
-      updateObjectEntity(object_entity, K, camera_state, kv.second, stamp);
+      ObjectMeasurementRecord object_rec;
+      object_rec.stamp = stamp;
+      object_rec.K = K;
+      object_rec.camera_state_at_measurement = camera_state;
+      object_rec.observations = kv.second;
+
+      insertMeasurementSorted(object_entity.measurements, object_rec);
+      trimMeasurements(object_entity.measurements);
+
+      if (!object_entity.filter->isInitialized() || stamp >= object_entity.last_stamp) {
+        applyObjectMeasurement(object_entity, object_rec);
+      } else {
+        replayObjectEntity(object_entity, stamp);
+      }
+
       publishObjectState(object_id, object_entity, stamp);
     }
   }
@@ -498,9 +607,10 @@ private:
   double sigma_a_;
   double sigma_alpha_;
   double sigma_px_;
+  int history_size_;
 
-  std::unordered_map<std::string, TrackedEntity> camera_entities_;
-  std::unordered_map<std::string, TrackedEntity> object_entities_;
+  std::unordered_map<std::string, CameraEntity> camera_entities_;
+  std::unordered_map<std::string, ObjectEntity> object_entities_;
 
   rclcpp::Subscription<pose_evaluator::msg::DetectedPoints>::SharedPtr detections_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
