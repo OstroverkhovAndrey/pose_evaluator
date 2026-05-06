@@ -49,7 +49,7 @@ public:
     history_size_ = declare_parameter<int>("history_size", 100);
 
     detections_sub_ = create_subscription<pose_evaluator::msg::DetectedPoints>(
-      "detected_points",
+      "coordinates_markers_in_image",
       10,
       std::bind(&PoseEvaluatorNode::detectionsCallback, this, std::placeholders::_1));
 
