@@ -77,7 +77,7 @@ class CameraPublisher : public rclcpp::Node
 {
 public:
     CameraPublisher()
-        : Node("latest_image_publisher_node")
+        : Node("test_cov_node")
     {
 
         declare_parameters();
