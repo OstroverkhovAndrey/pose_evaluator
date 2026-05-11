@@ -72,13 +72,16 @@ private:
     std::vector<WorldPointObservation> observations;
   };
 
+
   struct ObjectMeasurementRecord
   {
     rclcpp::Time stamp;
     CameraIntrinsics K;
     State camera_state_at_measurement;
+    Cov12 camera_covariance;
     std::vector<ObjectPointObservation> observations;
   };
+
 
   template<typename MeasurementRecordT>
   struct TrackedEntity
@@ -385,34 +388,45 @@ private:
   // Применение одного измерения объекта
   // ------------------------------------------------------------
   void applyObjectMeasurement(ObjectEntity & entity, const ObjectMeasurementRecord & rec)
-  {
-    if (rec.observations.size() < 4) {
+{
+  if (rec.observations.size() < 4) {
+    return;
+  }
+
+  if (!entity.filter->isInitialized()) {
+    if (!initializeObjectFilterFromPnP(entity, rec.K, rec.camera_state_at_measurement, rec.observations)) {
       return;
     }
-
-    if (!entity.filter->isInitialized()) {
-      if (!initializeObjectFilterFromPnP(entity, rec.K, rec.camera_state_at_measurement, rec.observations)) {
-        return;
-      }
-      entity.last_stamp = rec.stamp;
-      saveSnapshot(entity, rec.stamp);
-      return;
-    }
-
-    double dt = (rec.stamp - entity.last_stamp).seconds();
-    if (dt < 0.0) {
-      dt = 0.0;
-    }
-
-    entity.filter->predict(dt);
-
-    ObjectPinholeMeasurementModel model(rec.K, rec.camera_state_at_measurement, rec.observations, sigma_px_);
-    Eigen::VectorXd z = model.measurementVector();
-    entity.filter->update(z, model);
-
     entity.last_stamp = rec.stamp;
     saveSnapshot(entity, rec.stamp);
+    return;
   }
+
+  double dt = (rec.stamp - entity.last_stamp).seconds();
+  if (dt < 0.0) {
+    dt = 0.0;
+  }
+
+  entity.filter->predict(dt);
+
+  ObjectPinholeMeasurementModel model(rec.K, rec.camera_state_at_measurement, rec.observations, sigma_px_);
+  Eigen::VectorXd z = model.measurementVector();
+
+  // Если это UKF, учитываем ковариацию камеры через совместные сигма-точки
+  if (auto * ukf = dynamic_cast<pose_evaluator::UnscentedKalmanFilter *>(entity.filter.get())) {
+    // Найти соответствующий camera entity для текущей camera_state_at_measurement
+    // Предполагаем, что ковариация камеры сохранена в rec.camera_covariance
+    ukf->updateWithCameraUncertainty(z, model, rec.camera_state_at_measurement, rec.camera_covariance);
+  } else {
+    // simple filter / другой фильтр
+    entity.filter->update(z, model);
+  }
+
+  entity.last_stamp = rec.stamp;
+  saveSnapshot(entity, rec.stamp);
+}
+
+  
 
   // ------------------------------------------------------------
   // Replay камеры при поступлении измерения из прошлого
@@ -585,6 +599,7 @@ private:
       object_rec.stamp = stamp;
       object_rec.K = K;
       object_rec.camera_state_at_measurement = camera_state;
+      object_rec.camera_covariance = camera_entity.filter->covariance();
       object_rec.observations = kv.second;
 
       insertMeasurementSorted(object_entity.measurements, object_rec);
