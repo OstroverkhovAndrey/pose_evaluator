@@ -12,6 +12,16 @@
     sigma_a: 0.00001
     sigma_alpha: 0.00001
     sigma_px: 0.5
+
+    use_plane_motion_constraints: true
+
+    plane_sigma_pz: 0.001
+    plane_sigma_vz: 0.001
+    plane_sigma_nx: 0.001
+    plane_sigma_ny: 0.001
+    plane_sigma_wx: 0.001
+    plane_sigma_wy: 0.001
+
     start_type_description_service: true
     use_sim_time: false
 

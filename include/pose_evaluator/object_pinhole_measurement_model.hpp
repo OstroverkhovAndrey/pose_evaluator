@@ -29,11 +29,18 @@ public:
 
   Eigen::VectorXd predictMeasurement(const State & object_state) const override
   {
+    return predictMeasurementWithCamera(object_state, camera_state_);
+  }
+
+  Eigen::VectorXd predictMeasurementWithCamera(
+    const State & object_state,
+    const State & camera_state) const
+  {
     Eigen::VectorXd zhat(measurementDim());
 
-    const Eigen::Matrix3d R_wc = camera_state_.q.toRotationMatrix();
+    const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
     const Eigen::Matrix3d R_cw = R_wc.transpose();
-    const Eigen::Vector3d p_wc = camera_state_.p;
+    const Eigen::Vector3d p_wc = camera_state.p;
 
     const Eigen::Matrix3d R_wo = object_state.q.toRotationMatrix();
     const Eigen::Vector3d p_wo = object_state.p;

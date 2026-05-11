@@ -16,19 +16,27 @@
 #include <opencv2/core.hpp>
 
 #include "pose_evaluator/msg/detected_points.hpp"
+
 #include "pose_evaluator/filter_factory.hpp"
+#include "pose_evaluator/ukf.hpp"
+
 #include "pose_evaluator/white_noise_rigid_body_model.hpp"
 #include "pose_evaluator/camera_pinhole_measurement_model.hpp"
 #include "pose_evaluator/object_pinhole_measurement_model.hpp"
+#include "pose_evaluator/plane_motion_measurement_model.hpp"
 
 using pose_evaluator::State;
 using pose_evaluator::Cov12;
 using pose_evaluator::IFilter;
+
 using pose_evaluator::CameraIntrinsics;
 using pose_evaluator::WorldPointObservation;
 using pose_evaluator::ObjectPointObservation;
+
 using pose_evaluator::CameraPinholeMeasurementModel;
 using pose_evaluator::ObjectPinholeMeasurementModel;
+using pose_evaluator::PlaneMotionMeasurementModel;
+
 using pose_evaluator::makeCameraFilter;
 using pose_evaluator::makeObjectFilter;
 using pose_evaluator::WhiteNoiseRigidBodyModel;
@@ -48,8 +56,20 @@ public:
 
     history_size_ = declare_parameter<int>("history_size", 100);
 
+    // Включение/выключение псевдоизмерений плоского движения
+    use_plane_motion_constraints_ =
+      declare_parameter<bool>("use_plane_motion_constraints", false);
+
+    // Шумы псевдоизмерений плоского движения
+    plane_sigma_pz_ = declare_parameter<double>("plane_sigma_pz", 1e-3);
+    plane_sigma_vz_ = declare_parameter<double>("plane_sigma_vz", 1e-3);
+    plane_sigma_nx_ = declare_parameter<double>("plane_sigma_nx", 1e-3);
+    plane_sigma_ny_ = declare_parameter<double>("plane_sigma_ny", 1e-3);
+    plane_sigma_wx_ = declare_parameter<double>("plane_sigma_wx", 1e-3);
+    plane_sigma_wy_ = declare_parameter<double>("plane_sigma_wy", 1e-3);
+
     detections_sub_ = create_subscription<pose_evaluator::msg::DetectedPoints>(
-      "coordinates_markers_in_image",
+      "detected_points",
       10,
       std::bind(&PoseEvaluatorNode::detectionsCallback, this, std::placeholders::_1));
 
@@ -72,16 +92,19 @@ private:
     std::vector<WorldPointObservation> observations;
   };
 
-
   struct ObjectMeasurementRecord
   {
     rclcpp::Time stamp;
     CameraIntrinsics K;
+
+    // Среднее состояния камеры на момент измерения
     State camera_state_at_measurement;
+
+    // Ковариация состояния камеры на момент измерения
     Cov12 camera_covariance;
+
     std::vector<ObjectPointObservation> observations;
   };
-
 
   template<typename MeasurementRecordT>
   struct TrackedEntity
@@ -89,7 +112,6 @@ private:
     std::unique_ptr<IFilter> filter;
     rclcpp::Time last_stamp{0, 0, RCL_ROS_TIME};
 
-    // История состояний и измерений для поддержки отката
     std::deque<FilterSnapshot> snapshots;
     std::deque<MeasurementRecordT> measurements;
   };
@@ -97,9 +119,6 @@ private:
   using CameraEntity = TrackedEntity<CameraMeasurementRecord>;
   using ObjectEntity = TrackedEntity<ObjectMeasurementRecord>;
 
-  // ------------------------------------------------------------
-  // Создание / получение фильтра камеры
-  // ------------------------------------------------------------
   CameraEntity & getOrCreateCameraEntity(const std::string & camera_id)
   {
     auto it = camera_entities_.find(camera_id);
@@ -107,7 +126,8 @@ private:
       return it->second;
     }
 
-    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    auto process_model =
+      std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
 
     CameraEntity entity;
     entity.filter = makeCameraFilter(camera_filter_type_, process_model);
@@ -117,9 +137,6 @@ private:
     return new_it->second;
   }
 
-  // ------------------------------------------------------------
-  // Создание / получение фильтра объекта
-  // ------------------------------------------------------------
   ObjectEntity & getOrCreateObjectEntity(const std::string & object_id)
   {
     auto it = object_entities_.find(object_id);
@@ -127,7 +144,8 @@ private:
       return it->second;
     }
 
-    auto process_model = std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
+    auto process_model =
+      std::make_shared<WhiteNoiseRigidBodyModel>(sigma_a_, sigma_alpha_);
 
     ObjectEntity entity;
     entity.filter = makeObjectFilter(object_filter_type_, process_model);
@@ -137,10 +155,8 @@ private:
     return new_it->second;
   }
 
-  // ------------------------------------------------------------
-  // Внутренние параметры камеры из CameraInfo
-  // ------------------------------------------------------------
-  static CameraIntrinsics intrinsicsFromCameraInfo(const sensor_msgs::msg::CameraInfo & info)
+  static CameraIntrinsics intrinsicsFromCameraInfo(
+    const sensor_msgs::msg::CameraInfo & info)
   {
     CameraIntrinsics K;
     K.fx = info.k[0];
@@ -170,18 +186,13 @@ private:
   {
     auto it = std::upper_bound(
       measurements.begin(), measurements.end(), m.stamp,
-      [](const rclcpp::Time & t, const T & rec) { return t < rec.stamp; });
+      [](const rclcpp::Time & t, const T & rec) {
+        return t < rec.stamp;
+      });
 
     measurements.insert(it, m);
   }
 
-  // ------------------------------------------------------------
-  // Инициализация фильтра камеры через solvePnP
-  // solvePnP: X_c = R_cw X_w + t_cw
-  // Фильтр хранит camera in world:
-  //   R_wc = R_cw^T
-  //   p_wc = -R_cw^T t_cw
-  // ------------------------------------------------------------
   bool initializeCameraFilterFromPnP(
     CameraEntity & entity,
     const CameraIntrinsics & K,
@@ -193,9 +204,16 @@ private:
 
     std::vector<cv::Point3f> world_points;
     std::vector<cv::Point2f> image_points;
+
     for (const auto & obs : observations) {
-      world_points.emplace_back(obs.point_world.x(), obs.point_world.y(), obs.point_world.z());
-      image_points.emplace_back(obs.pixel.x(), obs.pixel.y());
+      world_points.emplace_back(
+        static_cast<float>(obs.point_world.x()),
+        static_cast<float>(obs.point_world.y()),
+        static_cast<float>(obs.point_world.z()));
+
+      image_points.emplace_back(
+        static_cast<float>(obs.pixel.x()),
+        static_cast<float>(obs.pixel.y()));
     }
 
     cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
@@ -206,7 +224,9 @@ private:
     cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
     cv::Mat rvec, tvec;
 
-    const bool ok = cv::solvePnP(world_points, image_points, camera_matrix, dist, rvec, tvec);
+    const bool ok = cv::solvePnP(
+      world_points, image_points, camera_matrix, dist, rvec, tvec);
+
     if (!ok) {
       return false;
     }
@@ -226,6 +246,9 @@ private:
       tvec.at<double>(1, 0),
       tvec.at<double>(2, 0));
 
+    // solvePnP: X_c = R_cw X_w + t_cw
+    // фильтр хранит camera->world:
+    // R_wc = R_cw^T, p_wc = -R_cw^T t_cw
     Eigen::Matrix3d R_wc = R_cw.transpose();
     Eigen::Vector3d p_wc = -R_wc * t_cw;
 
@@ -245,15 +268,6 @@ private:
     return true;
   }
 
-  // ------------------------------------------------------------
-  // Инициализация фильтра объекта через solvePnP
-  // solvePnP: X_c = R_co X_o + t_co
-  // Камера в мире:
-  //   X_w = R_wc X_c + p_wc
-  // Следовательно:
-  //   R_wo = R_wc R_co
-  //   p_wo = p_wc + R_wc t_co
-  // ------------------------------------------------------------
   bool initializeObjectFilterFromPnP(
     ObjectEntity & entity,
     const CameraIntrinsics & K,
@@ -266,9 +280,16 @@ private:
 
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
+
     for (const auto & obs : observations) {
-      object_points.emplace_back(obs.point_object.x(), obs.point_object.y(), obs.point_object.z());
-      image_points.emplace_back(obs.pixel.x(), obs.pixel.y());
+      object_points.emplace_back(
+        static_cast<float>(obs.point_object.x()),
+        static_cast<float>(obs.point_object.y()),
+        static_cast<float>(obs.point_object.z()));
+
+      image_points.emplace_back(
+        static_cast<float>(obs.pixel.x()),
+        static_cast<float>(obs.pixel.y()));
     }
 
     cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
@@ -279,7 +300,9 @@ private:
     cv::Mat dist = cv::Mat::zeros(5, 1, CV_64F);
     cv::Mat rvec, tvec;
 
-    const bool ok = cv::solvePnP(object_points, image_points, camera_matrix, dist, rvec, tvec);
+    const bool ok = cv::solvePnP(
+      object_points, image_points, camera_matrix, dist, rvec, tvec);
+
     if (!ok) {
       return false;
     }
@@ -299,6 +322,9 @@ private:
       tvec.at<double>(1, 0),
       tvec.at<double>(2, 0));
 
+    // object->camera и camera->world дают object->world:
+    // R_wo = R_wc R_co
+    // p_wo = p_wc + R_wc t_co
     const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
     const Eigen::Matrix3d R_wo = R_wc * R_co;
     const Eigen::Vector3d p_wo = camera_state.p + R_wc * t_co;
@@ -324,7 +350,10 @@ private:
     if (!entity.filter->isInitialized()) {
       return;
     }
-    entity.snapshots.push_back(FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+
+    entity.snapshots.push_back(
+      FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+
     trimSnapshots(entity.snapshots);
   }
 
@@ -333,7 +362,10 @@ private:
     if (!entity.filter->isInitialized()) {
       return;
     }
-    entity.snapshots.push_back(FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+
+    entity.snapshots.push_back(
+      FilterSnapshot{stamp, entity.filter->state(), entity.filter->covariance()});
+
     trimSnapshots(entity.snapshots);
   }
 
@@ -351,9 +383,28 @@ private:
     return true;
   }
 
-  // ------------------------------------------------------------
-  // Применение одного измерения камеры
-  // ------------------------------------------------------------
+  void applyPlaneMotionConstraint(IFilter & filter)
+  {
+    if (!use_plane_motion_constraints_) {
+      return;
+    }
+
+    if (!filter.isInitialized()) {
+      return;
+    }
+
+    PlaneMotionMeasurementModel plane_model(
+      plane_sigma_pz_,
+      plane_sigma_vz_,
+      plane_sigma_nx_,
+      plane_sigma_ny_,
+      plane_sigma_wx_,
+      plane_sigma_wy_);
+
+    Eigen::VectorXd z = plane_model.measurementVector();
+    filter.update(z, plane_model);
+  }
+
   void applyCameraMeasurement(CameraEntity & entity, const CameraMeasurementRecord & rec)
   {
     if (rec.observations.size() < 4) {
@@ -364,6 +415,8 @@ private:
       if (!initializeCameraFilterFromPnP(entity, rec.K, rec.observations)) {
         return;
       }
+
+
       entity.last_stamp = rec.stamp;
       saveSnapshot(entity, rec.stamp);
       return;
@@ -378,59 +431,67 @@ private:
 
     CameraPinholeMeasurementModel model(rec.K, rec.observations, sigma_px_);
     Eigen::VectorXd z = model.measurementVector();
+
     entity.filter->update(z, model);
+
 
     entity.last_stamp = rec.stamp;
     saveSnapshot(entity, rec.stamp);
   }
 
-  // ------------------------------------------------------------
-  // Применение одного измерения объекта
-  // ------------------------------------------------------------
   void applyObjectMeasurement(ObjectEntity & entity, const ObjectMeasurementRecord & rec)
-{
-  if (rec.observations.size() < 4) {
-    return;
-  }
-
-  if (!entity.filter->isInitialized()) {
-    if (!initializeObjectFilterFromPnP(entity, rec.K, rec.camera_state_at_measurement, rec.observations)) {
+  {
+    if (rec.observations.size() < 4) {
       return;
     }
+
+    if (!entity.filter->isInitialized()) {
+      if (!initializeObjectFilterFromPnP(
+            entity, rec.K, rec.camera_state_at_measurement, rec.observations)) {
+        return;
+      }
+
+      applyPlaneMotionConstraint(*entity.filter);
+
+      entity.last_stamp = rec.stamp;
+      saveSnapshot(entity, rec.stamp);
+      return;
+    }
+
+    double dt = (rec.stamp - entity.last_stamp).seconds();
+    if (dt < 0.0) {
+      dt = 0.0;
+    }
+
+    entity.filter->predict(dt);
+
+    ObjectPinholeMeasurementModel model(
+      rec.K,
+      rec.camera_state_at_measurement,
+      rec.observations,
+      sigma_px_);
+
+    Eigen::VectorXd z = model.measurementVector();
+
+    // Если объектный фильтр — UKF, учитываем ковариацию камеры
+    if (auto * ukf =
+          dynamic_cast<pose_evaluator::UnscentedKalmanFilter *>(entity.filter.get())) {
+      ukf->updateWithCameraUncertainty(
+        z,
+        model,
+        rec.camera_state_at_measurement,
+        rec.camera_covariance);
+    } else {
+      entity.filter->update(z, model);
+    }
+
+    // Дополнительный update псевдоизмерением плоского движения
+    applyPlaneMotionConstraint(*entity.filter);
+
     entity.last_stamp = rec.stamp;
     saveSnapshot(entity, rec.stamp);
-    return;
   }
 
-  double dt = (rec.stamp - entity.last_stamp).seconds();
-  if (dt < 0.0) {
-    dt = 0.0;
-  }
-
-  entity.filter->predict(dt);
-
-  ObjectPinholeMeasurementModel model(rec.K, rec.camera_state_at_measurement, rec.observations, sigma_px_);
-  Eigen::VectorXd z = model.measurementVector();
-
-  // Если это UKF, учитываем ковариацию камеры через совместные сигма-точки
-  if (auto * ukf = dynamic_cast<pose_evaluator::UnscentedKalmanFilter *>(entity.filter.get())) {
-    // Найти соответствующий camera entity для текущей camera_state_at_measurement
-    // Предполагаем, что ковариация камеры сохранена в rec.camera_covariance
-    ukf->updateWithCameraUncertainty(z, model, rec.camera_state_at_measurement, rec.camera_covariance);
-  } else {
-    // simple filter / другой фильтр
-    entity.filter->update(z, model);
-  }
-
-  entity.last_stamp = rec.stamp;
-  saveSnapshot(entity, rec.stamp);
-}
-
-  
-
-  // ------------------------------------------------------------
-  // Replay камеры при поступлении измерения из прошлого
-  // ------------------------------------------------------------
   void replayCameraEntity(CameraEntity & entity, const rclcpp::Time & stamp)
   {
     if (entity.snapshots.empty()) {
@@ -449,7 +510,8 @@ private:
     const FilterSnapshot base_snapshot = *snapshot_it;
     restoreSnapshot(entity, base_snapshot);
 
-    while (!entity.snapshots.empty() && entity.snapshots.back().stamp > base_snapshot.stamp) {
+    while (!entity.snapshots.empty() &&
+           entity.snapshots.back().stamp > base_snapshot.stamp) {
       entity.snapshots.pop_back();
     }
 
@@ -460,9 +522,6 @@ private:
     }
   }
 
-  // ------------------------------------------------------------
-  // Replay объекта при поступлении измерения из прошлого
-  // ------------------------------------------------------------
   void replayObjectEntity(ObjectEntity & entity, const rclcpp::Time & stamp)
   {
     if (entity.snapshots.empty()) {
@@ -481,7 +540,8 @@ private:
     const FilterSnapshot base_snapshot = *snapshot_it;
     restoreSnapshot(entity, base_snapshot);
 
-    while (!entity.snapshots.empty() && entity.snapshots.back().stamp > base_snapshot.stamp) {
+    while (!entity.snapshots.empty() &&
+           entity.snapshots.back().stamp > base_snapshot.stamp) {
       entity.snapshots.pop_back();
     }
 
@@ -492,13 +552,10 @@ private:
     }
   }
 
-  // ------------------------------------------------------------
-  // Публикация состояния объекта
-  // Скорости публикуются напрямую из состояния фильтра:
-  //   linear = x.v
-  //   angular = x.w
-  // ------------------------------------------------------------
-  void publishObjectState(const std::string & object_id, ObjectEntity & entity, const rclcpp::Time & stamp)
+  void publishObjectState(
+    const std::string & object_id,
+    ObjectEntity & entity,
+    const rclcpp::Time & stamp)
   {
     if (!entity.filter->isInitialized()) {
       return;
@@ -524,7 +581,7 @@ private:
     geometry_msgs::msg::TwistStamped twist_msg;
     twist_msg.header = pose_msg.header;
 
-    // Используем скорости прямо из состояния фильтра
+    // Скорости публикуются напрямую из состояния фильтра
     twist_msg.twist.linear.x = x.v.x();
     twist_msg.twist.linear.y = x.v.y();
     twist_msg.twist.linear.z = x.v.z();
@@ -538,12 +595,6 @@ private:
     (void)object_id;
   }
 
-  // ------------------------------------------------------------
-  // Главный callback
-  // 1. Разделение входных точек на world / object
-  // 2. Обновление фильтра камеры
-  // 3. Обновление фильтров объектов
-  // ------------------------------------------------------------
   void detectionsCallback(const pose_evaluator::msg::DetectedPoints::SharedPtr msg)
   {
     const rclcpp::Time stamp = msg->header.stamp;
@@ -589,6 +640,7 @@ private:
     }
 
     const State camera_state = camera_entity.filter->state();
+    const Cov12 camera_cov = camera_entity.filter->covariance();
 
     // ---------- Объекты ----------
     for (auto & kv : object_obs_map) {
@@ -599,7 +651,7 @@ private:
       object_rec.stamp = stamp;
       object_rec.K = K;
       object_rec.camera_state_at_measurement = camera_state;
-      object_rec.camera_covariance = camera_entity.filter->covariance();
+      object_rec.camera_covariance = camera_cov;
       object_rec.observations = kv.second;
 
       insertMeasurementSorted(object_entity.measurements, object_rec);
@@ -623,6 +675,15 @@ private:
   double sigma_alpha_;
   double sigma_px_;
   int history_size_;
+
+  bool use_plane_motion_constraints_;
+
+  double plane_sigma_pz_;
+  double plane_sigma_vz_;
+  double plane_sigma_nx_;
+  double plane_sigma_ny_;
+  double plane_sigma_wx_;
+  double plane_sigma_wy_;
 
   std::unordered_map<std::string, CameraEntity> camera_entities_;
   std::unordered_map<std::string, ObjectEntity> object_entities_;

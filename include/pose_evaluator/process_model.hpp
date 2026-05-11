@@ -4,7 +4,7 @@
 namespace pose_evaluator
 {
 
-using ProcessNoiseVec = Eigen::Matrix<double, 6, 1>;   // [a, alpha]
+using ProcessNoiseVec = Eigen::Matrix<double, 6, 1>;
 using ProcessNoiseCov = Eigen::Matrix<double, 6, 6>;
 
 class IProcessModel

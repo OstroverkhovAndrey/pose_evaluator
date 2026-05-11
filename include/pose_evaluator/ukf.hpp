@@ -94,9 +94,6 @@ public:
     P_ = 0.5 * (P + P.transpose());
   }
 
-  // ------------------------------------------------------------
-  // Обычный update: неопределённость камеры не учитывается
-  // ------------------------------------------------------------
   void update(const Eigen::VectorXd & z, const IMeasurementModel & model) override
   {
     if (!initialized_) {
@@ -105,7 +102,6 @@ public:
 
     constexpr int NX = 12;
     const int nz = model.measurementDim();
-
     const double lambda = params_.kappa;
 
     Eigen::Matrix<double, NX, NX> Pj = P_;
@@ -149,18 +145,13 @@ public:
     S += model.measurementCov();
 
     Eigen::MatrixXd K = Pxz * S.ldlt().solve(Eigen::MatrixXd::Identity(nz, nz));
-    Eigen::VectorXd innovation = z - z_mean;
-    ErrorVec dx_corr = K * innovation;
+    ErrorVec dx_corr = K * (z - z_mean);
 
     x_ = StateOps::boxPlus(x_mean, dx_corr);
     P_ = P_ - K * S * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());
   }
 
-  // ------------------------------------------------------------
-  // Новый update для объекта: учитывает ковариацию камеры
-  // через совместные сигма-точки объекта и камеры
-  // ------------------------------------------------------------
   void updateWithCameraUncertainty(
     const Eigen::VectorXd & z,
     const ObjectPinholeMeasurementModel & model,
@@ -171,14 +162,13 @@ public:
       return;
     }
 
-    constexpr int NO = 12;   // object error-state dim
-    constexpr int NC = 12;   // camera error-state dim
+    constexpr int NO = 12;
+    constexpr int NC = 12;
     constexpr int NOC = NO + NC;
-    const int nz = model.measurementDim();
 
+    const int nz = model.measurementDim();
     const double lambda = params_.kappa;
 
-    // Совместная ковариация [P_object, 0; 0, P_camera]
     Eigen::Matrix<double, NOC, NOC> P_joint = Eigen::Matrix<double, NOC, NOC>::Zero();
     P_joint.block<12,12>(0,0) = P_;
     P_joint.block<12,12>(12,12) = camera_covariance;
@@ -189,7 +179,6 @@ public:
     std::vector<double> Wm(2 * NOC + 1), Wc(2 * NOC + 1);
     computeWeights(NOC, lambda, Wm, Wc);
 
-    // Совместные сигма-точки по объекту и камере
     std::vector<State> sigma_obj(2 * NOC + 1);
     std::vector<State> sigma_cam(2 * NOC + 1);
 
@@ -202,33 +191,25 @@ public:
       ErrorVec dx_obj = d.segment<12>(0);
       ErrorVec dx_cam = d.segment<12>(12);
 
-      sigma_obj[i + 1]      = StateOps::boxPlus(x_, dx_obj);
-      sigma_cam[i + 1]      = StateOps::boxPlus(camera_state, dx_cam);
+      sigma_obj[i + 1] = StateOps::boxPlus(x_, dx_obj);
+      sigma_cam[i + 1] = StateOps::boxPlus(camera_state, dx_cam);
 
       sigma_obj[i + 1 + NOC] = StateOps::boxPlus(x_, -dx_obj);
       sigma_cam[i + 1 + NOC] = StateOps::boxPlus(camera_state, -dx_cam);
     }
 
-    // Среднее объекта (камера не обновляется этим фильтром)
     State x_mean = computeStateMean(sigma_obj, Wm);
 
-    // Прогон через measurement model: z_i = h(x_o_i, x_c_i)
     std::vector<Eigen::VectorXd> sigma_z(2 * NOC + 1, Eigen::VectorXd(nz));
     for (int i = 0; i < 2 * NOC + 1; ++i) {
-      sigma_z[i] = predictObjectMeasurement(
-        model.getIntrinsics(),
-        sigma_cam[i],
-        sigma_obj[i],
-        model.getObservations());
+      sigma_z[i] = model.predictMeasurementWithCamera(sigma_obj[i], sigma_cam[i]);
     }
 
-    // Среднее измерение
     Eigen::VectorXd z_mean = Eigen::VectorXd::Zero(nz);
     for (int i = 0; i < 2 * NOC + 1; ++i) {
       z_mean += Wm[i] * sigma_z[i];
     }
 
-    // Ковариация измерения и кросс-ковариация объект-измерение
     Eigen::MatrixXd S = Eigen::MatrixXd::Zero(nz, nz);
     Eigen::MatrixXd Pxz = Eigen::MatrixXd::Zero(NO, nz);
 
@@ -240,12 +221,10 @@ public:
       Pxz += Wc[i] * dx_obj * dz.transpose();
     }
 
-    // Собственный шум измерения пикселей
     S += model.measurementCov();
 
     Eigen::MatrixXd K = Pxz * S.ldlt().solve(Eigen::MatrixXd::Identity(nz, nz));
-    Eigen::VectorXd innovation = z - z_mean;
-    ErrorVec dx_corr = K * innovation;
+    ErrorVec dx_corr = K * (z - z_mean);
 
     x_ = StateOps::boxPlus(x_mean, dx_corr);
     P_ = P_ - K * S * K.transpose();
@@ -256,41 +235,7 @@ public:
   const Cov12 & covariance() const override { return P_; }
 
 private:
-  static Eigen::VectorXd predictObjectMeasurement(
-    const CameraIntrinsics & K,
-    const State & camera_state,
-    const State & object_state,
-    const std::vector<ObjectPointObservation> & observations)
-  {
-    Eigen::VectorXd zhat(2 * observations.size());
-
-    const Eigen::Matrix3d R_wc = camera_state.q.toRotationMatrix();
-    const Eigen::Matrix3d R_cw = R_wc.transpose();
-    const Eigen::Vector3d p_wc = camera_state.p;
-
-    const Eigen::Matrix3d R_wo = object_state.q.toRotationMatrix();
-    const Eigen::Vector3d p_wo = object_state.p;
-
-    for (size_t i = 0; i < observations.size(); ++i) {
-      const Eigen::Vector3d Xo = observations[i].point_object;
-      const Eigen::Vector3d Xw = R_wo * Xo + p_wo;
-      const Eigen::Vector3d Xc = R_cw * (Xw - p_wc);
-
-      const double u = K.fx * (Xc.x() / Xc.z()) + K.cx;
-      const double v = K.fy * (Xc.y() / Xc.z()) + K.cy;
-
-      zhat(2 * i + 0) = u;
-      zhat(2 * i + 1) = v;
-    }
-
-    return zhat;
-  }
-
-  void computeWeights(
-    int n,
-    double lambda,
-    std::vector<double> & Wm,
-    std::vector<double> & Wc) const
+  void computeWeights(int n, double lambda, std::vector<double> & Wm, std::vector<double> & Wc) const
   {
     Wm[0] = lambda / (n + lambda);
     Wc[0] = Wm[0];
@@ -301,9 +246,7 @@ private:
     }
   }
 
-  State computeStateMean(
-    const std::vector<State> & sigma,
-    const std::vector<double> & Wm) const
+  State computeStateMean(const std::vector<State> & sigma, const std::vector<double> & Wm) const
   {
     State mean = sigma[0];
 
